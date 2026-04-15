@@ -1,0 +1,65 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: 'Noto Sans', 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* AG Grid theme overrides for UiPath look */
+.ag-theme-alpine {
+  --ag-header-background-color: #0d1b2a;
+  --ag-header-foreground-color: #ffffff;
+  --ag-odd-row-background-color: #f8f9fa;
+  --ag-row-hover-color: #fff1ed;
+  --ag-selected-row-background-color: #ffe0d6;
+  --ag-range-selection-border-color: #fa4616;
+  --ag-checkbox-checked-color: #fa4616;
+  --ag-input-focus-border-color: #fa4616;
+  --ag-alpine-active-color: #fa4616;
+  font-family: 'Noto Sans', sans-serif;
+  font-size: 13px;
+}
+
+.ag-theme-alpine .ag-header-cell-label {
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.ag-theme-alpine .ag-header-cell-text {
+  color: #ffffff !important;
+}
+
+.ag-theme-alpine .ag-icon {
+  color: #ffffff !important;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f3f5;
+}
+::-webkit-scrollbar-thumb {
+  background: #adb5bd;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #6c757d;
+}
+
+/* Severity badge animations */
+.severity-badge {
+  transition: transform 0.15s ease;
+}
+.severity-badge:hover {
+  transform: scale(1.05);
+}
