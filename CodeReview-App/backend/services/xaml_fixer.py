@@ -94,43 +94,91 @@ def _rule_priority(rule_id: str) -> int:
 # Each handler returns: { modified: bool, content: str, changes: list[str] }
 
 
+def _extract_name_from_finding(finding: Finding, kind: str = "variable") -> str | None:
+    """Extract the variable/argument name from a finding's description or activity_path."""
+    desc = finding.description
+    activity = finding.activity_path or ""
+
+    # Try activity_path first (e.g. "Variable: myVar" or "Argument: myArg")
+    m = re.search(r"(?:Variable|Argument):\s*(\w+)", activity)
+    if m:
+        return m.group(1)
+
+    # Try description patterns
+    patterns = [
+        rf"[Vv]ariable\s+['\"](\w+)['\"]",
+        rf"[Aa]rgument\s+['\"](\w+)['\"]",
+        r"named\s+['\"](\w+)['\"]",
+        r"'(\w+)'",
+    ]
+    for pat in patterns:
+        m = re.search(pat, desc)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _rename_in_xaml(content: str, old_name: str, new_name: str) -> tuple[str, int]:
+    """Rename a variable/argument across all locations in XAML content.
+
+    Handles:
+      1. Variable/Argument declarations:  Name="oldName"
+      2. Standalone VB expression refs:   [oldName]
+      3. VB expressions with members:     [oldName.ToString()] [oldName & " x"]
+      4. Inside complex expressions:      [CInt(oldName)] [oldName + other]
+      5. Argument key bindings:           Key="oldName"  (InvokeWorkflow arguments)
+      6. Default values with variable:    Default="[oldName]"
+
+    Returns (new_content, replacement_count).
+    """
+    count = 0
+
+    # 1. Variable/Argument declaration: Name="oldName"
+    pattern = re.compile(rf'\bName="{re.escape(old_name)}"')
+    content, n = pattern.subn(f'Name="{new_name}"', content)
+    count += n
+
+    # 2. Argument key bindings: Key="oldName" (InvokeWorkflowFile argument maps)
+    pattern = re.compile(rf'\bKey="{re.escape(old_name)}"')
+    content, n = pattern.subn(f'Key="{new_name}"', content)
+    count += n
+
+    # 3. VB expression references inside [...] brackets
+    #    Matches oldName as a whole word inside brackets.
+    #    Handles: [oldName], [oldName.Prop], [oldName & "x"], [CInt(oldName)], etc.
+    #    Uses word boundary (\b) to avoid partial matches (e.g. "oldName2" stays).
+    pattern = re.compile(
+        r'(\[(?:[^\[\]])*?)'           # opening [ and any content before the name
+        rf'\b{re.escape(old_name)}\b'  # the variable name as a whole word
+        r'((?:[^\[\]])*?\])'           # any content after the name and closing ]
+    )
+    content, n = pattern.subn(rf'\g<1>{new_name}\g<2>', content)
+    count += n
+
+    return content, count
+
+
 def _fix_naming_variable(content: str, findings: list[Finding], expected_prefix: str, var_type: str) -> dict:
     """Generic variable naming fix — prepend expected prefix to variable names."""
     modified = False
     changes = []
     new_content = content
+    seen = set()
 
     for f in findings:
-        # Extract the variable name from the description
-        desc = f.description
-        # Try to find the variable name — it's usually quoted or after "Variable '"
-        match = re.search(r"[Vv]ariable\s+['\"](\w+)['\"]", desc)
-        if not match:
-            match = re.search(r"named\s+['\"](\w+)['\"]", desc)
-        if not match:
-            match = re.search(r"'(\w+)'", desc)
-        if not match:
+        var_name = _extract_name_from_finding(f, "variable")
+        if not var_name or var_name in seen:
+            continue
+        seen.add(var_name)
+
+        if var_name.startswith(expected_prefix):
             continue
 
-        var_name = match.group(1)
-        if var_name.startswith(expected_prefix):
-            continue  # Already has correct prefix
-
         new_name = expected_prefix + var_name
-        # Replace variable name in all contexts (declarations, usages)
-        old_patterns = [
-            f'Name="{var_name}"',
-            f"[{var_name}]",
-            f'"{var_name}"',
-        ]
-        for old_pat in old_patterns:
-            new_pat = old_pat.replace(var_name, new_name)
-            if old_pat in new_content:
-                new_content = new_content.replace(old_pat, new_pat)
-                modified = True
-
-        if modified:
-            changes.append(f"{f.rule_id}: Renamed variable '{var_name}' -> '{new_name}'")
+        new_content, count = _rename_in_xaml(new_content, var_name, new_name)
+        if count > 0:
+            modified = True
+            changes.append(f"{f.rule_id}: Renamed variable '{var_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
 
@@ -140,35 +188,22 @@ def _fix_naming_argument(content: str, findings: list[Finding], expected_prefix:
     modified = False
     changes = []
     new_content = content
+    seen = set()
 
     for f in findings:
-        desc = f.description
-        match = re.search(r"[Aa]rgument\s+['\"](\w+)['\"]", desc)
-        if not match:
-            match = re.search(r"named\s+['\"](\w+)['\"]", desc)
-        if not match:
-            match = re.search(r"'(\w+)'", desc)
-        if not match:
+        arg_name = _extract_name_from_finding(f, "argument")
+        if not arg_name or arg_name in seen:
             continue
+        seen.add(arg_name)
 
-        arg_name = match.group(1)
         if arg_name.startswith(expected_prefix):
             continue
 
         new_name = expected_prefix + arg_name
-        old_patterns = [
-            f'Name="{arg_name}"',
-            f"[{arg_name}]",
-            f'"{arg_name}"',
-        ]
-        for old_pat in old_patterns:
-            new_pat = old_pat.replace(arg_name, new_name)
-            if old_pat in new_content:
-                new_content = new_content.replace(old_pat, new_pat)
-                modified = True
-
-        if modified:
-            changes.append(f"{f.rule_id}: Renamed argument '{arg_name}' -> '{new_name}'")
+        new_content, count = _rename_in_xaml(new_content, arg_name, new_name)
+        if count > 0:
+            modified = True
+            changes.append(f"{f.rule_id}: Renamed argument '{arg_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
 
@@ -180,20 +215,17 @@ def _fix_st_nmg_001(content: str, findings: list[Finding]) -> dict:
     modified = False
     changes = []
     new_content = content
+    seen = set()
 
     for f in findings:
-        desc = f.description
-        match = re.search(r"[Vv]ariable\s+['\"](\w+)['\"]", desc)
-        if not match:
-            match = re.search(r"'(\w+)'", desc)
-        if not match:
+        var_name = _extract_name_from_finding(f, "variable")
+        if not var_name or var_name in seen:
             continue
-
-        var_name = match.group(1)
+        seen.add(var_name)
 
         # Determine expected prefix from the variable type mentioned in description
         expected_prefix = "str_"  # default
-        desc_lower = desc.lower()
+        desc_lower = f.description.lower()
         if "int32" in desc_lower or "int64" in desc_lower or "integer" in desc_lower:
             expected_prefix = "int_"
         elif "boolean" in desc_lower or "bool" in desc_lower:
@@ -213,19 +245,10 @@ def _fix_st_nmg_001(content: str, findings: list[Finding]) -> dict:
             continue
 
         new_name = expected_prefix + var_name
-        old_patterns = [
-            f'Name="{var_name}"',
-            f"[{var_name}]",
-            f'"{var_name}"',
-        ]
-        for old_pat in old_patterns:
-            new_pat = old_pat.replace(var_name, new_name)
-            if old_pat in new_content:
-                new_content = new_content.replace(old_pat, new_pat)
-                modified = True
-
-        if modified:
-            changes.append(f"ST-NMG-001: Renamed variable '{var_name}' -> '{new_name}'")
+        new_content, count = _rename_in_xaml(new_content, var_name, new_name)
+        if count > 0:
+            modified = True
+            changes.append(f"ST-NMG-001: Renamed variable '{var_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
 
@@ -235,20 +258,17 @@ def _fix_st_nmg_002(content: str, findings: list[Finding]) -> dict:
     modified = False
     changes = []
     new_content = content
+    seen = set()
 
     for f in findings:
-        desc = f.description
-        match = re.search(r"[Aa]rgument\s+['\"](\w+)['\"]", desc)
-        if not match:
-            match = re.search(r"'(\w+)'", desc)
-        if not match:
+        arg_name = _extract_name_from_finding(f, "argument")
+        if not arg_name or arg_name in seen:
             continue
-
-        arg_name = match.group(1)
+        seen.add(arg_name)
 
         # Determine direction prefix from description
         expected_prefix = "in_"  # default
-        desc_lower = desc.lower()
+        desc_lower = f.description.lower()
         if "inout" in desc_lower or "io_" in desc_lower:
             expected_prefix = "io_"
         elif "out" in desc_lower and "inout" not in desc_lower:
@@ -258,19 +278,10 @@ def _fix_st_nmg_002(content: str, findings: list[Finding]) -> dict:
             continue
 
         new_name = expected_prefix + arg_name
-        old_patterns = [
-            f'Name="{arg_name}"',
-            f"[{arg_name}]",
-            f'"{arg_name}"',
-        ]
-        for old_pat in old_patterns:
-            new_pat = old_pat.replace(arg_name, new_name)
-            if old_pat in new_content:
-                new_content = new_content.replace(old_pat, new_pat)
-                modified = True
-
-        if modified:
-            changes.append(f"ST-NMG-002: Renamed argument '{arg_name}' -> '{new_name}'")
+        new_content, count = _rename_in_xaml(new_content, arg_name, new_name)
+        if count > 0:
+            modified = True
+            changes.append(f"ST-NMG-002: Renamed argument '{arg_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
 
