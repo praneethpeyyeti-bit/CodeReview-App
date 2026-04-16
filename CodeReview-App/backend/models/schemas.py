@@ -4,21 +4,13 @@ from typing import Literal
 Severity = Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
 FindingStatus = Literal["Open", "Accepted", "Rejected", "Fixed"]
 FindingCategory = Literal[
-    "Compile Errors",
-    "Hallucinated Properties",
-    "Security",
-    "Error Handling",
-    "Naming Conventions",
-    "Logging",
-    "Architecture",
-    "Configuration",
-    "Lint — Studio Crash",
-    "Lint — Compile/Runtime",
-    "Lint — Best Practice",
-    "SAP",
+    "Naming",
+    "Design Best Practices",
     "UI Automation",
-    "REFramework",
-    "Data Handling",
+    "Performance",
+    "Reliability",
+    "Security",
+    "General",
 ]
 
 

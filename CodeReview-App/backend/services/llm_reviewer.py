@@ -127,6 +127,18 @@ def review_with_llm(
         ]
         try:
             response = batch_llm.invoke(messages)
+        except OSError as e:
+            # [Errno 22] Invalid argument — common on Windows when the
+            # token is expired/invalid and the SSL handshake fails, or
+            # when the HTTP connection is reset.
+            import traceback
+            logger.error("OSError during LLM call: %s\n%s", e, traceback.format_exc())
+            raise RuntimeError(
+                f"Network/OS error during LLM call: {e}. "
+                "This often means the authentication token has expired. "
+                "Try refreshing the token (click the refresh button or run 'uipath auth'), "
+                "then retry the review."
+            ) from e
         except Exception as e:
             error_msg = str(e)
             if "401" in error_msg or "Unauthorized" in error_msg:

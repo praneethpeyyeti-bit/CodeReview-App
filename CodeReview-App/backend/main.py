@@ -215,7 +215,8 @@ async def _run_review_job(
         )
         _review_jobs[job_id]["status"] = "completed"
     except Exception as e:
-        logger.error("Job %s: FAILED — %s", job_id[:8], e)
+        import traceback
+        logger.error("Job %s: FAILED — %s\n%s", job_id[:8], e, traceback.format_exc())
         _review_jobs[job_id]["status"] = "failed"
         _review_jobs[job_id]["error"] = str(e)
 
