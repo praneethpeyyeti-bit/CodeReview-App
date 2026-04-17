@@ -33,10 +33,6 @@ _DIRECTION_PREFIXES = {
     "InOut": "io_",
 }
 
-_ARRAY_LIST_PATTERN = re.compile(r"(System\.Collections\.Generic\.List|.*\[\])", re.IGNORECASE)
-_DICT_PATTERN = re.compile(r"System\.Collections\.Generic\.Dictionary", re.IGNORECASE)
-
-
 def fix_xaml(xml_content: str, findings: list[Finding]) -> dict:
     """
     Apply fixes to XAML content based on findings.
@@ -296,6 +292,269 @@ def _fix_st_nmg_011(content: str, findings: list[Finding]) -> dict:
     return _fix_naming_argument(content, findings, "dt_")
 
 
+# ── UI-PRR-001: Set SimulateClick="True" on Click activities ──────
+
+def _fix_ui_prr_001(content: str, findings: list[Finding]) -> dict:
+    """UI-PRR-001: Set SimulateClick=True on Click/NClick activities."""
+    modified = False
+    changes = []
+    new_content = content
+
+    # Add SimulateClick="True" where missing or set to False/{x:Null}
+    # Match Click/NClick elements that don't already have SimulateClick="True"
+    pattern = re.compile(
+        r'(<(?:\w+:)?(?:Click|NClick)\b)'   # opening tag
+        r'((?:(?!SimulateClick)[^>])*)'      # attributes before (no SimulateClick yet)
+        r'(?:SimulateClick="(?:False|\{x:Null\})")?'  # optional False/{x:Null} to replace
+        r'([^>]*>)',                          # rest of tag
+    )
+
+    def replacer(m):
+        tag_start = m.group(1)
+        before = m.group(2)
+        after = m.group(3)
+        full = m.group(0)
+        if 'SimulateClick="True"' in full:
+            return full
+        # Remove existing False/{x:Null} and add True
+        cleaned = re.sub(r'\s*SimulateClick="[^"]*"', '', full)
+        # Insert attribute before the closing > or />
+        if cleaned.endswith("/>"):
+            return cleaned[:-2] + ' SimulateClick="True" />'
+        elif cleaned.endswith(">"):
+            return cleaned[:-1] + ' SimulateClick="True">'
+        return cleaned
+
+    new_content = pattern.sub(replacer, content)
+    if new_content != content:
+        count = content.count("<Click ") + content.count("<NClick ") + content.count("<ui:Click ") + content.count("<ui:NClick ")
+        modified = True
+        changes.append(f"UI-PRR-001: Set SimulateClick=True on Click activities")
+
+    return {"modified": modified, "content": new_content, "changes": changes}
+
+
+# ── UI-PRR-002: Set SimulateType="True" on TypeInto activities ────
+
+def _fix_ui_prr_002(content: str, findings: list[Finding]) -> dict:
+    """UI-PRR-002: Set SimulateType=True on TypeInto/NTypeInto activities."""
+    modified = False
+    changes = []
+    new_content = content
+
+    pattern = re.compile(
+        r'(<(?:\w+:)?(?:TypeInto|NTypeInto)\b)'
+        r'((?:(?!SimulateType)[^>])*)'
+        r'(?:SimulateType="(?:False|\{x:Null\})")?'
+        r'([^>]*>)',
+    )
+
+    def replacer(m):
+        full = m.group(0)
+        if 'SimulateType="True"' in full:
+            return full
+        cleaned = re.sub(r'\s*SimulateType="[^"]*"', '', full)
+        if cleaned.endswith("/>"):
+            return cleaned[:-2] + ' SimulateType="True" />'
+        elif cleaned.endswith(">"):
+            return cleaned[:-1] + ' SimulateType="True">'
+        return cleaned
+
+    new_content = pattern.sub(replacer, content)
+    if new_content != content:
+        modified = True
+        changes.append(f"UI-PRR-002: Set SimulateType=True on TypeInto activities")
+
+    return {"modified": modified, "content": new_content, "changes": changes}
+
+
+# ── GEN-001: Remove unused variable declarations ─────────────────
+
+def _fix_gen_001(content: str, findings: list[Finding]) -> dict:
+    """GEN-001: Remove unused Variable declarations from XAML."""
+    modified = False
+    changes = []
+    new_content = content
+
+    for f in findings:
+        var_name = _extract_name_from_finding(f, "variable")
+        if not var_name:
+            continue
+
+        # Remove the <Variable ... Name="varName" ... /> line
+        # Handles both self-closing and multi-line Variable elements
+        pattern = re.compile(
+            r'\s*<Variable\b[^>]*\bName="' + re.escape(var_name) + r'"[^>]*/>\s*',
+            re.DOTALL,
+        )
+        new_content, n = pattern.subn('\n', new_content)
+        if n > 0:
+            modified = True
+            changes.append(f"GEN-001: Removed unused variable '{var_name}'")
+
+    return {"modified": modified, "content": new_content, "changes": changes}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HYBRID FIXES: Use ET to find elements, string ops to modify content.
+# Never re-serialize the full document (ET.tostring drops xmlns decls).
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _fix_st_dbp_003(content: str, findings: list[Finding]) -> dict:
+    """ST-DBP-003: Add LogMessage to empty Catch blocks.
+
+    Strategy: Find empty ActivityAction blocks (have </ActivityAction.Argument>
+    immediately followed by </ActivityAction>) and insert a Sequence+LogMessage
+    between them. Uses ET only to find the exception variable name.
+    """
+    import uuid
+
+    # Use ET to find exception variable names per catch
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Collect exception var names from DelegateInArgument elements
+    exc_vars: list[str] = []
+    for elem in root.iter():
+        local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if local == "DelegateInArgument":
+            for k, v in elem.attrib.items():
+                if "TypeArguments" in k and "Exception" in v:
+                    exc_vars.append(elem.attrib.get("Name", "exception"))
+                    break
+
+    if not exc_vars:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Now do string insertion: find </ActivityAction.Argument> followed by </ActivityAction>
+    modified = False
+    changes = []
+    new_content = content
+    exc_idx = 0
+
+    pattern = re.compile(
+        r'(</ActivityAction\.Argument>)'
+        r'(\s*)(</ActivityAction>)',
+    )
+
+    def replacer(m):
+        nonlocal modified, exc_idx
+        closing_arg = m.group(1)
+        whitespace = m.group(2)
+        closing_aa = m.group(3)
+
+        exc_var = exc_vars[exc_idx] if exc_idx < len(exc_vars) else "exception"
+        exc_idx += 1
+
+        uid = uuid.uuid4().hex[:6]
+        indent = "            "
+
+        insert = (
+            f'\n{indent}<Sequence DisplayName="Catch Handler - Auto-Fix" '
+            f'sap:VirtualizedContainerService.HintSize="400,200" '
+            f'sap2010:WorkflowViewState.IdRef="Sequence_AutoFix_{uid}">\n'
+            f'{indent}  <ui:LogMessage DisplayName="Log Error" '
+            f'sap:VirtualizedContainerService.HintSize="350,120" '
+            f'sap2010:WorkflowViewState.IdRef="LogMessage_AutoFix_{uid}" '
+            f'Level="Error" '
+            f'Message="[&quot;Exception: &quot; &amp; {exc_var}.GetType().Name '
+            f'&amp; &quot; - &quot; &amp; {exc_var}.Message '
+            f'&amp; &quot; | Source: &quot; &amp; {exc_var}.Source]" />\n'
+            f'{indent}</Sequence>\n{indent[:-2]}'
+        )
+
+        modified = True
+        return closing_arg + insert + closing_aa
+
+    new_content = pattern.sub(replacer, new_content)
+
+    if modified:
+        changes.append(f"ST-DBP-003: Added LogMessage to {exc_idx} empty Catch block(s)")
+
+    return {"modified": modified, "content": new_content, "changes": changes}
+
+
+def _fix_ui_prr_001(content: str, findings: list[Finding]) -> dict:
+    """UI-PRR-001: Set SimulateClick=True on Click activities.
+
+    Strategy: Find Click/NClick opening tags and add SimulateClick="True"
+    if not already present.
+    """
+    modified = False
+    changes = []
+    new_content = content
+
+    # Match Click or NClick elements (with namespace prefix) that don't have SimulateClick="True"
+    pattern = re.compile(
+        r'(<(?:\w+:)?(?:Click|NClick)\b)([^>]*?)(/?>\s*)',
+        re.DOTALL,
+    )
+
+    fixed = 0
+    def replacer(m):
+        nonlocal fixed
+        tag_open = m.group(1)
+        attrs = m.group(2)
+        tag_close = m.group(3)
+
+        if 'SimulateClick="True"' in attrs or 'SimulateClick="true"' in attrs:
+            return m.group(0)
+
+        # Remove existing SimulateClick="False" or SimulateClick="{x:Null}"
+        attrs = re.sub(r'\s*SimulateClick="[^"]*"', '', attrs)
+        fixed += 1
+        return f'{tag_open}{attrs} SimulateClick="True"{tag_close}'
+
+    new_content = pattern.sub(replacer, new_content)
+
+    if fixed > 0:
+        modified = True
+        changes.append(f"UI-PRR-001: Set SimulateClick=True on {fixed} Click activity(ies)")
+
+    return {"modified": modified, "content": new_content, "changes": changes}
+
+
+def _fix_ui_prr_002(content: str, findings: list[Finding]) -> dict:
+    """UI-PRR-002: Set SimulateType=True on TypeInto activities.
+
+    Strategy: Find TypeInto/NTypeInto opening tags and add SimulateType="True"
+    if not already present.
+    """
+    modified = False
+    changes = []
+    new_content = content
+
+    pattern = re.compile(
+        r'(<(?:\w+:)?(?:TypeInto|NTypeInto)\b)([^>]*?)(/?>\s*)',
+        re.DOTALL,
+    )
+
+    fixed = 0
+    def replacer(m):
+        nonlocal fixed
+        tag_open = m.group(1)
+        attrs = m.group(2)
+        tag_close = m.group(3)
+
+        if 'SimulateType="True"' in attrs or 'SimulateType="true"' in attrs:
+            return m.group(0)
+
+        attrs = re.sub(r'\s*SimulateType="[^"]*"', '', attrs)
+        fixed += 1
+        return f'{tag_open}{attrs} SimulateType="True"{tag_close}'
+
+    new_content = pattern.sub(replacer, new_content)
+
+    if fixed > 0:
+        modified = True
+        changes.append(f"UI-PRR-002: Set SimulateType=True on {fixed} TypeInto activity(ies)")
+
+    return {"modified": modified, "content": new_content, "changes": changes}
+
+
 # ── No-op handlers (manual fix required) ─────────────────────────
 
 def _noop_fix(content: str, findings: list[Finding]) -> dict:
@@ -317,7 +576,7 @@ _FIX_HANDLERS: dict[str, Callable] = {
     "ST-NMG-008": _noop_fix,
     "ST-NMG-012": _noop_fix,
     "ST-NMG-016": _noop_fix,
-    # Design Best Practices — manual fix required
+    # Design Best Practices
     "ST-DBP-002": _noop_fix,
     "ST-DBP-003": _noop_fix,
     "ST-DBP-007": _noop_fix,
@@ -336,16 +595,17 @@ _FIX_HANDLERS: dict[str, Callable] = {
     "UI-REL-001": _noop_fix,
     "UI-SEC-004": _noop_fix,
     "UI-SEC-010": _noop_fix,
-    # Performance — manual fix required
+    # Performance — detection only (adding attributes to Click/TypeInto
+    # corrupts property child elements like Click.Target in complex XAML)
     "UI-PRR-001": _noop_fix,
     "UI-PRR-002": _noop_fix,
     "UI-PRR-003": _noop_fix,
-    # Reliability — manual fix required
+    # Reliability — detection only (removal unsafe via regex)
     "GEN-REL-001": _noop_fix,
     # Security — manual fix required
     "UX-DBP-029": _noop_fix,
-    # General — manual fix required
-    "GEN-001": _noop_fix,
+    # General — auto-fixable
+    "GEN-001": _fix_gen_001,
     "GEN-002": _noop_fix,
     "GEN-003": _noop_fix,
     "GEN-004": _noop_fix,

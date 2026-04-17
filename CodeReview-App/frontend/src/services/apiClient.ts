@@ -20,7 +20,15 @@ export async function submitReview(
     const err = await submitRes.json().catch(() => ({ detail: 'Unknown error' }));
     throw new Error(err.detail ?? `HTTP ${submitRes.status}`);
   }
-  const { job_id } = await submitRes.json();
+  const data = await submitRes.json();
+
+  // Static mode returns the full ReviewResponse directly (no polling)
+  if (data.findings !== undefined) {
+    return data as ReviewResponse;
+  }
+
+  // LLM mode returns a job_id — poll for results
+  const { job_id } = data;
 
   // Step 2: Poll for results every 3 seconds
   const maxPolls = 400; // 400 * 3s = 20 minutes max
@@ -55,6 +63,7 @@ export async function submitReview(
 
 export interface FixFileResult {
   file_name: string;
+  zip_entry_path: string;
   original_content: string;
   modified_content: string;
   changes: string[];
@@ -64,6 +73,7 @@ export interface FixResponse {
   project_name: string;
   files: FixFileResult[];
   project_json?: string | null;
+  fixed_rule_ids?: string[];
 }
 
 export interface AcceptFixResponse {
@@ -82,7 +92,7 @@ export async function submitFix(formData: FormData): Promise<FixResponse> {
 
 export async function acceptFix(
   projectName: string,
-  files: { file_name: string; modified_content: string }[],
+  files: { file_name: string; zip_entry_path?: string; modified_content: string }[],
   outputDir?: string,
   projectJson?: string | null
 ): Promise<AcceptFixResponse> {

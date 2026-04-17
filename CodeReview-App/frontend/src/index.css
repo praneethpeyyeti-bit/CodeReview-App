@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;500;600;700;800&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -8,9 +8,151 @@ body {
   font-family: 'Noto Sans', 'Inter', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  background: #f8f9fa;
 }
 
-/* AG Grid theme overrides for UiPath look */
+/* ── Glass card style ──────────────────────────────── */
+.glass-card {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+/* ── Section card with left accent ─────────────────── */
+.section-card {
+  @apply bg-white rounded-2xl border border-ui-g100 overflow-hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03);
+  transition: box-shadow 0.3s ease, transform 0.2s ease;
+}
+.section-card:hover {
+  box-shadow: 0 4px 16px rgba(0,0,0,0.08), 0 8px 32px rgba(0,0,0,0.04);
+}
+
+/* ── Section header bar ────────────────────────────── */
+.section-header {
+  @apply px-5 py-3 flex items-center justify-between cursor-pointer select-none;
+  background: linear-gradient(135deg, #0d1b2a 0%, #1b2d45 100%);
+  transition: background 0.2s ease;
+}
+.section-header:hover {
+  background: linear-gradient(135deg, #1b2d45 0%, #253b56 100%);
+}
+.section-header h2 {
+  @apply text-white font-semibold text-sm tracking-wide flex items-center gap-2;
+}
+
+/* ── Metric card ───────────────────────────────────── */
+.metric-card {
+  @apply bg-white rounded-xl border border-ui-g100 px-5 py-4;
+  transition: all 0.25s ease;
+}
+.metric-card:hover {
+  @apply border-ui-g200;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.08), 0 8px 32px rgba(0,0,0,0.04);
+  transform: translateY(-2px);
+}
+.metric-value {
+  @apply text-3xl font-extrabold text-ui-navy leading-none mt-1;
+}
+.metric-label {
+  @apply text-[11px] font-semibold uppercase tracking-wider text-ui-g500;
+}
+
+/* ── Severity dot indicators ───────────────────────── */
+.severity-dot {
+  @apply w-2.5 h-2.5 rounded-full inline-block;
+}
+.severity-dot-critical { background: #e53935; }
+.severity-dot-high { background: #f57c00; }
+.severity-dot-medium { background: #fbc02d; }
+.severity-dot-low { background: #1e88e5; }
+.severity-dot-info { background: #90a4ae; }
+
+/* ── Severity badges ───────────────────────────────── */
+.severity-badge {
+  @apply inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.severity-badge:hover {
+  transform: scale(1.05);
+}
+.severity-badge-critical { @apply bg-red-600 text-white; }
+.severity-badge-high { @apply bg-orange-500 text-white; }
+.severity-badge-medium { @apply bg-amber-400 text-amber-900; }
+.severity-badge-low { @apply bg-blue-500 text-white; }
+.severity-badge-info { @apply bg-gray-400 text-white; }
+
+/* ── Severity bar (horizontal progress-like) ──────── */
+.severity-bar {
+  @apply h-2 rounded-full;
+  transition: width 0.8s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ── Action button ─────────────────────────────────── */
+.btn-primary {
+  @apply inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl transition-all;
+  background: linear-gradient(135deg, #fa4616 0%, #ff6b3d 100%);
+  color: white;
+  box-shadow: 0 2px 8px rgba(250, 70, 22, 0.25);
+}
+.btn-primary:hover {
+  box-shadow: 0 4px 16px rgba(250, 70, 22, 0.35);
+  transform: translateY(-1px);
+}
+.btn-primary:disabled {
+  @apply opacity-50 cursor-not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-secondary {
+  @apply inline-flex items-center gap-2 px-5 py-2.5 bg-ui-navy text-white text-sm font-semibold rounded-xl transition-all;
+}
+.btn-secondary:hover {
+  @apply bg-ui-navy-light;
+  transform: translateY(-1px);
+}
+
+.btn-success {
+  @apply inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl transition-all;
+  background: linear-gradient(135deg, #00c853 0%, #00e676 100%);
+  color: white;
+  box-shadow: 0 2px 8px rgba(0, 200, 83, 0.25);
+}
+.btn-success:hover {
+  box-shadow: 0 4px 16px rgba(0, 200, 83, 0.35);
+  transform: translateY(-1px);
+}
+.btn-success:disabled {
+  @apply opacity-50 cursor-not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* ── Category pill ─────────────────────────────────── */
+.category-pill {
+  @apply inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-medium transition-all cursor-pointer border;
+}
+.category-pill-active {
+  @apply bg-ui-orange-light border-ui-orange text-ui-orange font-semibold shadow-sm;
+}
+.category-pill-inactive {
+  @apply bg-white border-ui-g200 text-ui-g600 hover:border-ui-orange hover:text-ui-orange;
+}
+
+/* ── Drop zone ─────────────────────────────────────── */
+.drop-zone {
+  @apply border-2 border-dashed rounded-2xl p-8 text-center transition-all cursor-pointer;
+}
+.drop-zone-idle {
+  @apply border-ui-g300 bg-gradient-to-br from-white to-ui-g50;
+}
+.drop-zone-active {
+  @apply border-ui-orange bg-ui-orange-light;
+  box-shadow: inset 0 0 30px rgba(250, 70, 22, 0.05);
+}
+
+/* ── AG Grid theme overrides ───────────────────────── */
 .ag-theme-alpine {
   --ag-header-background-color: #0d1b2a;
   --ag-header-foreground-color: #ffffff;
@@ -21,45 +163,73 @@ body {
   --ag-checkbox-checked-color: #fa4616;
   --ag-input-focus-border-color: #fa4616;
   --ag-alpine-active-color: #fa4616;
+  --ag-border-radius: 0;
   font-family: 'Noto Sans', sans-serif;
   font-size: 13px;
 }
-
 .ag-theme-alpine .ag-header-cell-label {
   font-weight: 600;
-  font-size: 12px;
+  font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.05em;
+}
+.ag-theme-alpine .ag-header-cell-text { color: #ffffff !important; }
+.ag-theme-alpine .ag-icon { color: #ffffff !important; }
+.ag-theme-alpine .ag-row { border-bottom: 1px solid #f1f3f5; }
+
+/* ── Custom scrollbar ──────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #ced4da; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #868e96; }
+
+/* ── Loading spinner ───────────────────────────────── */
+.loading-pulse {
+  animation: loadPulse 2s ease-in-out infinite;
+}
+@keyframes loadPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
 }
 
-.ag-theme-alpine .ag-header-cell-text {
-  color: #ffffff !important;
+/* ── Verdict ring animation ────────────────────────── */
+.verdict-ring {
+  animation: ringPop 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+@keyframes ringPop {
+  0% { transform: scale(0); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
 }
 
-.ag-theme-alpine .ag-icon {
-  color: #ffffff !important;
+/* ── Pipeline workflow animation ───────────────────── */
+.pipeline-icon {
+  opacity: 0;
+  transform: scale(0.6) translateY(8px);
+  animation: pipelineIconIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+.pipeline-icon-1 { animation-delay: 0.4s; }
+.pipeline-icon-2 { animation-delay: 1.0s; }
+.pipeline-icon-3 { animation-delay: 1.6s; }
+.pipeline-icon-4 { animation-delay: 2.2s; }
+.pipeline-icon-5 { animation-delay: 2.8s; }
+
+@keyframes pipelineIconIn {
+  0% { opacity: 0; transform: scale(0.6) translateY(8px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
 }
 
-/* Custom scrollbar */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+/* Arrow connectors: slide in from left + fade */
+.pipeline-arrow {
+  opacity: 0;
+  transform: translateX(-10px);
+  animation: pipelineArrowIn 0.4s ease-out forwards;
 }
-::-webkit-scrollbar-track {
-  background: #f1f3f5;
-}
-::-webkit-scrollbar-thumb {
-  background: #adb5bd;
-  border-radius: 4px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #6c757d;
-}
+.pipeline-arrow-1 { animation-delay: 0.7s; }
+.pipeline-arrow-2 { animation-delay: 1.3s; }
+.pipeline-arrow-3 { animation-delay: 1.9s; }
+.pipeline-arrow-4 { animation-delay: 2.5s; }
 
-/* Severity badge animations */
-.severity-badge {
-  transition: transform 0.15s ease;
-}
-.severity-badge:hover {
-  transform: scale(1.05);
+@keyframes pipelineArrowIn {
+  0% { opacity: 0; transform: translateX(-10px); }
+  100% { opacity: 1; transform: translateX(0); }
 }

@@ -1,62 +1,35 @@
 # UiPath XAML Code Review App
 
-An AI-powered code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 47 Workflow Analyzer rules, and auto-fix naming convention violations.
+An AI-powered and static analysis code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 37 Workflow Analyzer rules, and auto-fix 5 naming convention violations.
 
 ## Features
 
-- **AI-Powered Review** - Analyze UiPath XAML workflows using Claude, GPT-4, Gemini, and more via UiPath AI Trust Layer
-- **47 Workflow Analyzer Rules** - Naming conventions, design best practices, UI automation, performance, reliability, security, and general quality checks
-- **Auto-Fix** - Automatically fix naming convention violations (variable/argument prefixes) with side-by-side diff preview
-- **Multiple Upload Modes** - Upload individual `.xaml` files or a `.zip` project archive
-- **Excel Export** - Export findings to a styled Excel workbook with summary, details, rule coverage, and statistics
-- **Interactive Results** - Filter findings by severity, category, and file using AG Grid
-- **Token Auto-Refresh** - Background OAuth token management for uninterrupted sessions
-
-## Screenshots
-
-The app provides:
-1. **Upload Zone** - Drag & drop files, select LLM model, enter project name
-2. **Summary Panel** - Pass/fail verdict, severity breakdown, category counts
-3. **Findings Grid** - Searchable, filterable data table with all findings
-4. **Diff Viewer** - Side-by-side before/after comparison for auto-fixes
+- **Static Analysis (No AI)** — Instant results from 36 rule checkers, no auth or Agent Units needed
+- **AI-Powered Review** — Deep analysis using Claude, GPT-4, Gemini via UiPath AI Trust Layer
+- **37 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, and general quality
+- **Auto-Fix 5 Rules** — Variable/argument prefix renaming and unused variable removal
+- **Side-by-Side Diff** — Preview all changes before accepting
+- **Folder Structure Preserved** — Fixed files maintain original ZIP directory layout
+- **Excel Export** — Styled report with executive summary, findings, per-file breakdown, and rule coverage
+- **Two-Page UI** — Clean upload page with animated workflow pipeline, full results dashboard
 
 ## Prerequisites
 
 - **Python** >= 3.11
 - **Node.js** >= 18
-- **UiPath CLI** - Authenticated with `uipath auth`
+- **UiPath CLI** (optional) — Only needed for AI model review (`uipath auth`)
 
 ## Quick Start
 
-### 1. Clone the repository
-
-```bash
-git clone <repository-url>
-cd CodeReview-APP
-```
-
-### 2. Backend Setup
+### 1. Backend
 
 ```bash
 cd backend
 pip install -r requirements.txt
-```
-
-Authenticate with UiPath (one-time setup):
-
-```bash
-uipath auth
-```
-
-This creates `.uipath/.auth.json` and populates `.env` with your access token. The server auto-refreshes the token in the background.
-
-Start the backend:
-
-```bash
 python -m uvicorn main:app --reload --port 8000
 ```
 
-### 3. Frontend Setup
+### 2. Frontend
 
 ```bash
 cd frontend
@@ -64,42 +37,52 @@ npm install
 npm run dev
 ```
 
-### 4. Open the App
+### 3. Open the App
 
 Navigate to [http://localhost:5173](http://localhost:5173)
 
 ## Usage
 
-1. **Enter a project name** for your review
-2. **Select an LLM model** (Claude 3.7 Sonnet recommended)
-3. **Upload files** - drag & drop `.xaml` files or a `.zip` project
-4. **Click "Start Review"** - the review runs asynchronously with progress polling
-5. **Review findings** - filter by severity, category, or file
-6. **Auto-fix** - click "Auto-Fix" to apply naming convention fixes
-7. **Review diffs** - inspect changes in the side-by-side diff viewer
-8. **Accept fixes** - save corrected files to the output directory
-9. **Export** - download findings as an Excel report
+1. **Choose analysis mode** — Toggle between "Static Analysis" (default, instant) or "AI-Powered"
+2. **Upload files** — Drag & drop `.xaml` files or a `.zip` project archive
+3. **Enter project name** and click "Start Review"
+4. **Review findings** — Filter by severity, category, or file in the dashboard
+5. **Auto-fix** — Click "Auto-Fix" to apply safe naming corrections
+6. **Review diffs** — Inspect changes side-by-side before accepting
+7. **Accept & save** — Fixed files saved preserving original folder structure
+8. **Export** — Download findings as an Excel report
 
-## Supported LLM Models
+## Review Modes
 
-| Model | Provider | Class |
-|-------|----------|-------|
-| Claude 3.7 Sonnet (recommended) | Anthropic | UiPathChat |
-| Claude 3.5 Sonnet v2 | Anthropic | UiPathChat |
-| Claude 3.5 Sonnet | Anthropic | UiPathChat |
-| Claude 3 Haiku | Anthropic | UiPathChat |
-| GPT-4o | OpenAI | UiPathAzureChatOpenAI |
-| GPT-4o Mini | OpenAI | UiPathAzureChatOpenAI |
-| GPT-4.1 Mini | OpenAI | UiPathAzureChatOpenAI |
-| o3 Mini | OpenAI | UiPathAzureChatOpenAI |
-| Gemini 2.0 Flash | Google | UiPathChat |
-| Gemini 1.5 Pro | Google | UiPathChat |
+| Mode | Speed | Auth Required | Rules | Agent Units |
+|------|-------|:---:|:---:|:---:|
+| Static Analysis | < 1 second | No | 36 checkers | None |
+| Claude 3.7 Sonnet | 30-60 seconds | Yes | 37 (via prompt) | Yes |
+| GPT-4o / Gemini | 30-60 seconds | Yes | 37 (via prompt) | Yes |
 
-## Rule Catalog
+## Auto-Fix Rules (5)
 
-### Naming (ST-NMG)
+Only text-level operations — safe for UiPath Studio to open without errors.
+
+| Rule | What it Fixes | Method |
+|------|--------------|--------|
+| ST-NMG-001 | Add type prefix to variables (str_, int_, dt_, bln_, dtm_, ts_, arr_, dic_) | Regex rename |
+| ST-NMG-002 | Add direction prefix to arguments (in_, out_, io_) | Regex rename |
+| ST-NMG-009 | Add dt_ prefix to DataTable variables | Regex rename |
+| ST-NMG-011 | Add dt_ prefix to DataTable arguments | Regex rename |
+| GEN-001 | Remove unused variable declarations | XML element removal |
+
+After auto-fix, findings for fixed rules show `status = "Fixed"` in the review grid.
+
+### Detection-Only Rules (32)
+
+The remaining 32 rules are detected and reported with specific recommendations, but require manual fix in UiPath Studio. UiPath's WPF-based XAML parser rejects programmatic insertion of elements with attributes — only text-level renames are safe.
+
+## Rule Catalog (37 Unique Rules, 7 Categories)
+
+### Naming (ST-NMG) — 10 rules
 | Rule ID | Rule Name | Auto-Fix |
-|---------|-----------|----------|
+|---------|-----------|:---:|
 | ST-NMG-001 | Variables Naming Convention | Yes |
 | ST-NMG-002 | Arguments Naming Convention | Yes |
 | ST-NMG-004 | Display Name Duplication | No |
@@ -111,132 +94,93 @@ Navigate to [http://localhost:5173](http://localhost:5173)
 | ST-NMG-012 | Argument Default Values | No |
 | ST-NMG-016 | Argument Length Exceeded | No |
 
-### Design Best Practices (ST-DBP)
-| Rule ID | Rule Name |
-|---------|-----------|
-| ST-DBP-002 | High Arguments Count |
-| ST-DBP-003 | Empty Catch Block |
-| ST-DBP-007 | Multiple Flowchart Layers |
-| ST-DBP-020 | Undefined Output Properties |
-| ST-DBP-023 | Empty Workflow |
-| ST-DBP-024 | Persistence Activity Check |
-| ST-DBP-025 | Variables Serialization |
-| ST-DBP-026 | Delay Activity Usage |
-| ST-DBP-027 | Persistence Best Practice |
-| ST-DBP-028 | Arguments Serialization |
+### Design Best Practices (ST-DBP) — 10 rules
+| Rule ID | Rule Name | Auto-Fix |
+|---------|-----------|:---:|
+| ST-DBP-002 | High Arguments Count | No |
+| ST-DBP-003 | Empty Catch Block | No |
+| ST-DBP-007 | Multiple Flowchart Layers | No |
+| ST-DBP-020 | Undefined Output Properties | No |
+| ST-DBP-023 | Empty Workflow | No |
+| ST-DBP-024 | Persistence Activity Check | No |
+| ST-DBP-025 | Variables Serialization | No |
+| ST-DBP-026 | Delay Activity Usage | No |
+| ST-DBP-027 | Persistence Best Practice | No |
+| ST-DBP-028 | Arguments Serialization | No |
 
-### UI Automation
-| Rule ID | Rule Name |
-|---------|-----------|
-| UI-DBP-006 | Container Usage |
-| UI-DBP-013 | Excel Automation Misuse |
-| UI-DBP-030 | Forbidden Variables in Selectors |
-| UI-PRR-004 | Hardcoded Delays |
-| UI-REL-001 | Large idx in Selectors |
-| UI-SEC-004 | Sensitive Data in Selectors |
-| UI-SEC-010 | App URL Restrictions |
+### UI Automation — 7 rules
+| Rule ID | Rule Name | Auto-Fix |
+|---------|-----------|:---:|
+| UI-DBP-006 | Container Usage | No |
+| UI-DBP-013 | Excel Automation Misuse | No |
+| UI-DBP-030 | Forbidden Variables in Selectors | No |
+| UI-PRR-004 | Hardcoded Delays | No |
+| UI-REL-001 | Large idx in Selectors | No |
+| UI-SEC-004 | Sensitive Data in Selectors | No |
+| UI-SEC-010 | App URL Restrictions | No |
 
-### Performance
-| Rule ID | Rule Name |
-|---------|-----------|
-| UI-PRR-001 | Simulate Click Not Used |
-| UI-PRR-002 | Simulate Type Not Used |
-| UI-PRR-003 | Open Application Misuse |
+### Performance (UI-PRR) — 3 rules
+| Rule ID | Rule Name | Auto-Fix |
+|---------|-----------|:---:|
+| UI-PRR-001 | Simulate Click Not Used | No |
+| UI-PRR-002 | Simulate Type Not Used | No |
+| UI-PRR-003 | Open Application Misuse | No |
 
-### Reliability
-| Rule ID | Rule Name |
-|---------|-----------|
-| UI-REL-001 | Selector Index Too Large |
-| GEN-REL-001 | Empty Sequences |
+### Reliability (GEN-REL) — 1 rule
+| Rule ID | Rule Name | Auto-Fix |
+|---------|-----------|:---:|
+| GEN-REL-001 | Empty Sequences | No |
 
-### Security
-| Rule ID | Rule Name |
-|---------|-----------|
-| UI-SEC-004 | Sensitive Data Exposure |
-| UI-SEC-010 | Unauthorized App Usage |
-| UX-DBP-029 | Insecure Password Usage |
+### Security — 3 rules
+| Rule ID | Rule Name | Auto-Fix |
+|---------|-----------|:---:|
+| UI-SEC-004 | Sensitive Data Exposure | No |
+| UI-SEC-010 | Unauthorized App Usage | No |
+| UX-DBP-029 | Insecure Password Usage | No |
 
-### General
-| Rule ID | Rule Name |
-|---------|-----------|
-| GEN-001 | Unused Variables |
-| GEN-002 | Unused Arguments |
-| GEN-003 | Empty Sequences |
-| GEN-004 | Project Structure Issues |
-| GEN-005 | Package Restrictions |
+### General (GEN) — 5 rules
+| Rule ID | Rule Name | Auto-Fix |
+|---------|-----------|:---:|
+| GEN-001 | Unused Variables | Yes |
+| GEN-002 | Unused Arguments | No |
+| GEN-003 | Empty Sequences | No |
+| GEN-004 | Project Structure Issues | No |
+| GEN-005 | Package Restrictions | No |
+
+Note: Source Excel has 41 rows (some rules listed in multiple categories), but 37 unique rule IDs.
 
 ## Project Structure
 
 ```
-CodeReview-APP/
-├── backend/
-│   ├── main.py                      # FastAPI server & API endpoints
-│   ├── requirements.txt             # Python dependencies
-│   ├── models/
-│   │   └── schemas.py               # Pydantic data models
-│   ├── prompts/
-│   │   └── code_review_prompt.py    # LLM system prompt (47 rules)
-│   ├── services/
-│   │   ├── llm_reviewer.py          # LLM invocation & batching
-│   │   ├── xaml_parser.py           # XAML parsing & context extraction
-│   │   ├── xaml_fixer.py            # Auto-fix engine
-│   │   ├── zip_extractor.py         # ZIP file handling
-│   │   └── token_refresh.py         # OAuth token auto-refresh
-│   └── output/                      # Saved original & modified files
-│
-├── frontend/
-│   ├── src/
-│   │   ├── pages/ReviewPage.tsx     # Main review workflow
-│   │   ├── components/
-│   │   │   ├── UploadZone.tsx       # File upload & model selection
-│   │   │   ├── ReviewGrid.tsx       # Findings data grid
-│   │   │   ├── SummaryPanel.tsx     # Review summary & metrics
-│   │   │   ├── DiffViewer.tsx       # Side-by-side diff viewer
-│   │   │   ├── ExportButton.tsx     # Excel export
-│   │   │   └── RulesCatalogModal.tsx# Rule reference modal
-│   │   ├── models/finding.ts        # TypeScript interfaces
-│   │   └── services/
-│   │       ├── apiClient.ts         # API client & polling
-│   │       └── excelExporter.ts     # Excel workbook generation
-│   └── package.json
-│
-├── CLAUDE.md                        # Claude Code project context
-└── README.md                        # This file
+backend/
+  main.py                      # FastAPI server & API endpoints
+  models/schemas.py            # Pydantic data models
+  prompts/code_review_prompt.py # LLM system prompt (AI mode only)
+  services/
+    static_reviewer.py         # Static analysis engine (36 rule checker functions)
+    llm_reviewer.py            # LLM invocation & batching
+    xaml_parser.py             # Enhanced XAML parsing (properties, selectors, catch blocks, expressions)
+    xaml_fixer.py              # Auto-fix engine (5 rules)
+    zip_extractor.py           # ZIP file handling
+    token_refresh.py           # OAuth token auto-refresh
+
+frontend/src/
+  context/ReviewContext.tsx    # Shared state provider
+  pages/
+    HomePage.tsx               # Upload + static/AI toggle + workflow animation
+    ResultsPage.tsx            # Dashboard + grid + auto-fix + diff
+  components/                  # UploadZone, SummaryPanel, ReviewGrid, DiffViewer, etc.
+  services/
+    apiClient.ts               # API client (sync + async polling)
+    excelExporter.ts           # Excel report (37 rules, 7 categories)
 ```
-
-## API Reference
-
-### `GET /api/health`
-Returns server health and token status.
-
-### `GET /api/models`
-Returns available LLM models with recommended flag.
-
-### `POST /api/review`
-Submit XAML files for review. Returns a `job_id` for polling.
-
-**Form Data:**
-- `project_name` (string, required)
-- `model_id` (string, optional, default: Claude 3.7 Sonnet)
-- `files` (file[], required) - `.xaml` files or a single `.zip`
-
-### `GET /api/review/{job_id}`
-Poll review job status. Returns findings when complete.
-
-### `POST /api/fix`
-Apply auto-fixes to uploaded XAML files based on review findings.
-
-### `POST /api/fix/accept`
-Save accepted modified files to the output directory.
-
-### `POST /api/refresh-token`
-Manually trigger OAuth token refresh.
 
 ## Tech Stack
 
-- **Backend**: FastAPI, Python 3.11+, UiPath LangChain SDK, Pydantic
-- **Frontend**: React 18, TypeScript, Vite, Tailwind CSS, AG Grid
-- **LLM**: UiPath AI Trust Layer (Claude, GPT-4, Gemini)
+- **Backend**: FastAPI, Python 3.11+, Pydantic
+- **Frontend**: React 18, TypeScript, Vite, Tailwind CSS, AG Grid, React Router
+- **Static Analysis**: Pure Python XML parsing + regex (no external dependencies)
+- **AI**: UiPath LangChain SDK (Claude, GPT-4, Gemini) — optional
 - **Export**: xlsx-js-style (Excel workbook generation)
 
 ## License

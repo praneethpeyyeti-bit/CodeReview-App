@@ -20,6 +20,9 @@ class ActivitySummary(BaseModel):
     is_inside_try_catch: bool
     is_inside_retry_scope: bool
     depth: int
+    child_count: int = 0
+    properties: dict[str, str] = {}
+    is_inside_container: bool = False
 
 
 class VariableSummary(BaseModel):
@@ -34,6 +37,13 @@ class ArgumentSummary(BaseModel):
     type: str
 
 
+class CatchBlockSummary(BaseModel):
+    exception_type: str = "Exception"
+    activity_count: int = 0
+    has_log_message: bool = False
+    has_rethrow: bool = False
+
+
 class ReviewContext(BaseModel):
     file_name: str
     zip_entry_path: str
@@ -45,6 +55,10 @@ class ReviewContext(BaseModel):
     has_start_log: bool
     has_end_log: bool
     imported_namespaces: list[str]
+    catch_blocks: list[CatchBlockSummary] = []
+    variable_usages: list[str] = []
+    argument_usages: list[str] = []
+    project_dependencies: dict[str, str] = {}
 
 
 class Finding(BaseModel):
@@ -53,7 +67,7 @@ class Finding(BaseModel):
     zip_entry_path: str
     workflow_name: str
     severity: Severity
-    category: str  # flexible to accept any category from the expanded rule catalog
+    category: str
     rule_id: str
     rule_name: str
     activity_path: str = ""

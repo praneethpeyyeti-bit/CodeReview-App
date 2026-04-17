@@ -151,6 +151,7 @@ export default function DiffViewer({ projectName, files, projectJson, onClose, o
     try {
       const filesToSave = files.map((f) => ({
         file_name: f.file_name,
+        zip_entry_path: f.zip_entry_path || '',
         modified_content:
           f.changes.length > 0 && !excludedFiles.has(f.file_name)
             ? f.modified_content

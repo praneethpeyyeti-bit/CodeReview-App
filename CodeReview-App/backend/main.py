@@ -26,6 +26,7 @@ from services.llm_reviewer import (
 )
 from services.token_refresh import token_refresh_loop, refresh_once, _seconds_until_expiry, _read_auth_json
 from services.xaml_fixer import fix_xaml
+from services.static_reviewer import review_static
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -62,6 +63,13 @@ app.add_middleware(
 # Model catalog — returned by GET /api/models
 # ──────────────────────────────────────────────────────────────
 MODEL_CATALOG = [
+    {
+        "id": "static",
+        "label": "Static Analysis (No AI)",
+        "provider": "Local",
+        "class": "Static",
+        "recommended": False,
+    },
     {
         "id": "gpt-4o-2024-08-06",
         "label": "GPT-4o (2024-08-06)",
@@ -231,7 +239,7 @@ async def review(
     load_dotenv(override=True)
 
     # Validate model_id
-    if model_id not in ALL_MODELS:
+    if model_id != "static" and model_id not in ALL_MODELS:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -283,12 +291,25 @@ async def review(
             detail="No .xaml files found in the upload.",
         )
 
+    # Extract project.json dependencies if available from zip
+    project_deps: dict[str, str] = {}
+    if is_zip:
+        pj = result.get("project_json")
+        if pj:
+            try:
+                import json as json_mod
+                pj_data = json_mod.loads(pj)
+                project_deps = pj_data.get("dependencies", {})
+            except Exception:
+                pass
+
     # Parse XAML files
     contexts = []
     for item in xaml_contents:
         try:
             ctx = parse_xaml_file(
-                item["file_name"], item["zip_entry_path"], item["content"]
+                item["file_name"], item["zip_entry_path"], item["content"],
+                project_dependencies=project_deps,
             )
             contexts.append(ctx)
         except Exception as e:
@@ -297,7 +318,21 @@ async def review(
                 detail=f"Failed to parse '{item['file_name']}': {e}",
             )
 
-    # Start background job
+    # Static analysis — synchronous, no LLM
+    if model_id == "static":
+        findings = review_static(contexts, project_name)
+        return ReviewResponse(
+            project_name=project_name,
+            upload_mode=upload_mode,
+            zip_file_name=zip_file_name,
+            reviewed_at=datetime.now(timezone.utc).isoformat(),
+            total_files=len(contexts),
+            skipped_files=skipped_files,
+            model_id="static",
+            findings=findings,
+        )
+
+    # Start background job (LLM)
     job_id = str(uuid.uuid4())
     _review_jobs[job_id] = {
         "status": "running",
@@ -387,22 +422,6 @@ async def apply_fixes(
     if not xaml_contents:
         raise HTTPException(status_code=400, detail="No .xaml files found.")
 
-    # Save originals
-    base_dir = os.path.join(os.path.dirname(__file__), "output", project_name)
-    orig_dir = os.path.join(base_dir, "original")
-    os.makedirs(orig_dir, exist_ok=True)
-
-    for item in xaml_contents:
-        orig_path = os.path.join(orig_dir, item["file_name"])
-        with open(orig_path, "w", encoding="utf-8") as fp:
-            fp.write(item["content"])
-
-    # Save project.json to original folder if present
-    if project_json:
-        pj_path = os.path.join(orig_dir, "project.json")
-        with open(pj_path, "w", encoding="utf-8") as fp:
-            fp.write(project_json)
-
     # Apply fixes per file
     fix_results = []
     for item in xaml_contents:
@@ -413,6 +432,7 @@ async def apply_fixes(
         if not file_findings:
             fix_results.append({
                 "file_name": item["file_name"],
+                "zip_entry_path": item.get("zip_entry_path", ""),
                 "original_content": item["content"],
                 "modified_content": item["content"],
                 "changes": [],
@@ -422,18 +442,33 @@ async def apply_fixes(
         result = fix_xaml(item["content"], file_findings)
         fix_results.append({
             "file_name": item["file_name"],
+            "zip_entry_path": item.get("zip_entry_path", ""),
             "original_content": result["original_content"],
             "modified_content": result["modified_content"],
             "changes": result["changes_applied"],
         })
 
-    return {"project_name": project_name, "files": fix_results, "project_json": project_json}
+    # Collect rule IDs that were actually fixed (had changes applied)
+    fixed_rule_ids: set[str] = set()
+    for fr in fix_results:
+        for change_msg in fr["changes"]:
+            # Extract rule ID from change message (e.g. "ST-NMG-001: Renamed ...")
+            parts = change_msg.split(":", 1)
+            if parts:
+                fixed_rule_ids.add(parts[0].strip())
+
+    return {
+        "project_name": project_name,
+        "files": fix_results,
+        "project_json": project_json,
+        "fixed_rule_ids": sorted(fixed_rule_ids),
+    }
 
 
 @app.post("/api/fix/accept")
 async def accept_fixes(request: Request):
     """
-    Save accepted modified XAML files to output/{project_name}/modified/.
+    Save accepted modified XAML files preserving the original ZIP folder structure.
     Accepts JSON body (no size limit) instead of Form data.
     """
     body = await request.json()
@@ -446,30 +481,43 @@ async def accept_fixes(request: Request):
         raise HTTPException(status_code=400, detail="project_name is required")
 
     if output_dir:
-        base_dir = os.path.join(output_dir, project_name)
+        base_dir = output_dir
     else:
         base_dir = os.path.join(os.path.dirname(__file__), "output", project_name)
-    mod_dir = os.path.join(base_dir, "modified")
-    os.makedirs(mod_dir, exist_ok=True)
+    os.makedirs(base_dir, exist_ok=True)
 
     saved = 0
     for item in file_list:
         file_name = item.get("file_name", "")
+        zip_entry_path = item.get("zip_entry_path", "")
         modified_content = item.get("modified_content", "")
         if not file_name:
             continue
-        out_path = os.path.join(mod_dir, file_name)
+
+        # Use zip_entry_path to preserve folder structure, fall back to file_name
+        relative_path = zip_entry_path if zip_entry_path else file_name
+        out_path = os.path.join(base_dir, relative_path)
+
+        # Create subdirectories as needed
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fp:
             fp.write(modified_content)
         saved += 1
 
-    # Save project.json to modified folder if present
+    # Save project.json preserving its location relative to the project root
     if project_json:
-        pj_path = os.path.join(mod_dir, "project.json")
+        # Find the common root folder from zip paths (e.g. "WindowsProject/")
+        zip_paths = [item.get("zip_entry_path", "") for item in file_list if item.get("zip_entry_path")]
+        if zip_paths:
+            root_folder = zip_paths[0].split("/")[0]
+            pj_path = os.path.join(base_dir, root_folder, "project.json")
+        else:
+            pj_path = os.path.join(base_dir, "project.json")
+        os.makedirs(os.path.dirname(pj_path), exist_ok=True)
         with open(pj_path, "w", encoding="utf-8") as fp:
             fp.write(project_json)
 
     return {
-        "saved_path": os.path.abspath(mod_dir),
+        "saved_path": os.path.abspath(base_dir),
         "file_count": saved,
     }
