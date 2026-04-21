@@ -69,7 +69,7 @@ Only text-level operations — safe for UiPath Studio to open without errors.
 | ST-NMG-001 | Add type prefix to variables (str_, int_, dt_, bln_, dtm_, ts_, arr_, dic_) | Regex rename |
 | ST-NMG-002 | Add direction prefix to arguments (in_, out_, io_) | Regex rename |
 | ST-NMG-009 | Add dt_ prefix to DataTable variables | Regex rename |
-| ST-NMG-011 | Add dt_ prefix to DataTable arguments | Regex rename |
+| ST-NMG-011 | Add direction prefix (in_/out_/io_) to DataTable arguments | Regex rename |
 | GEN-001 | Remove unused variable declarations | XML element removal |
 
 After auto-fix, findings for fixed rules show `status = "Fixed"` in the review grid.
@@ -90,7 +90,7 @@ The remaining 32 rules are detected and reported with specific recommendations, 
 | ST-NMG-006 | Variable Overrides Argument | No |
 | ST-NMG-008 | Variable Length Exceeded | No |
 | ST-NMG-009 | DataTable Variable Prefix | Yes |
-| ST-NMG-011 | DataTable Argument Prefix | Yes |
+| ST-NMG-011 | DataTable Argument Naming | Yes |
 | ST-NMG-012 | Argument Default Values | No |
 | ST-NMG-016 | Argument Length Exceeded | No |
 

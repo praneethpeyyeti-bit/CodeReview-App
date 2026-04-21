@@ -29,7 +29,7 @@ export const ALL_RULES: { rule_id: string; rule_name: string; category: FindingC
   { rule_id: 'ST-NMG-006', rule_name: 'Variable Overrides Argument', category: 'Naming' },
   { rule_id: 'ST-NMG-008', rule_name: 'Variable Length Exceeded', category: 'Naming' },
   { rule_id: 'ST-NMG-009', rule_name: 'Datatable Variable Prefix', category: 'Naming' },
-  { rule_id: 'ST-NMG-011', rule_name: 'Datatable Argument Prefix', category: 'Naming' },
+  { rule_id: 'ST-NMG-011', rule_name: 'DataTable Argument Naming', category: 'Naming' },
   { rule_id: 'ST-NMG-012', rule_name: 'Argument Default Values', category: 'Naming' },
   { rule_id: 'ST-NMG-016', rule_name: 'Argument Length Exceeded', category: 'Naming' },
   // Design Best Practices (10)

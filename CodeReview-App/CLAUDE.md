@@ -122,7 +122,7 @@ Only text-level renames and element removal — never modifies XML structure or 
 | ST-NMG-001 | Add type prefix to variables (str_, int_, dt_, bln_, dtm_, ts_, arr_, dic_) | Regex rename across all XAML locations |
 | ST-NMG-002 | Add direction prefix to arguments (in_, out_, io_) | Regex rename across all XAML locations |
 | ST-NMG-009 | Add dt_ prefix to DataTable variables | Regex rename |
-| ST-NMG-011 | Add dt_ prefix to DataTable arguments | Regex rename |
+| ST-NMG-011 | Add direction prefix (in_/out_/io_) to DataTable arguments | Regex rename |
 | GEN-001 | Remove unused variable declarations | Remove self-closing `<Variable/>` element |
 
 After auto-fix, findings for fixed rules get `status = "Fixed"` in the review grid.

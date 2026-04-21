@@ -288,8 +288,41 @@ def _fix_st_nmg_009(content: str, findings: list[Finding]) -> dict:
 
 
 def _fix_st_nmg_011(content: str, findings: list[Finding]) -> dict:
-    """ST-NMG-011: Datatable Argument Prefix — add dt_ prefix."""
-    return _fix_naming_argument(content, findings, "dt_")
+    """ST-NMG-011: DataTable Argument Naming — add direction prefix.
+
+    Per UiPath convention, arguments use direction prefixes (in_/out_/io_) only.
+    """
+    direction_prefixes = {"In": "in_", "Out": "out_", "InOut": "io_"}
+    modified = False
+    changes = []
+    new_content = content
+    seen = set()
+
+    for f in findings:
+        arg_name = _extract_name_from_finding(f, "argument")
+        if not arg_name or arg_name in seen:
+            continue
+        seen.add(arg_name)
+
+        # Determine direction from description (e.g. "direction: In", "direction: Out")
+        desc_lower = f.description.lower()
+        if "inout" in desc_lower:
+            expected = "io_"
+        elif "out" in desc_lower:
+            expected = "out_"
+        else:
+            expected = "in_"
+
+        if arg_name.startswith(expected):
+            continue
+
+        new_name = expected + arg_name
+        new_content, count = _rename_in_xaml(new_content, arg_name, new_name)
+        if count > 0:
+            modified = True
+            changes.append(f"ST-NMG-011: Renamed DataTable argument '{arg_name}' -> '{new_name}' ({count} location(s))")
+
+    return {"modified": modified, "content": new_content, "changes": changes}
 
 
 # ── UI-PRR-001: Set SimulateClick="True" on Click activities ──────

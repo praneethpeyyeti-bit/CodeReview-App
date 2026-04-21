@@ -29,7 +29,7 @@ ST-NMG-005: Variable Overrides Variable — Variable shadowing in inner scopes. 
 ST-NMG-006: Variable Overrides Argument — Conflict between variable and argument names. Rename variables or arguments clearly.
 ST-NMG-008: Variable Length Exceeded — Variable name too long. Keep names concise, ideally under 20-30 characters.
 ST-NMG-009: Datatable Variable Prefix — Missing DataTable prefix. Use dt_ prefix for DataTables.
-ST-NMG-011: Datatable Argument Prefix — Missing DataTable argument prefix. Use dt_ prefix for DataTable arguments.
+ST-NMG-011: DataTable Argument Naming — DataTable argument missing direction prefix. Arguments use only direction prefixes (in_/out_/io_), never datatype prefixes.
 ST-NMG-012: Argument Default Values — Missing or incorrect default values. Assign appropriate default values.
 ST-NMG-016: Argument Length Exceeded — Argument name too long. Keep argument names short and meaningful.
 

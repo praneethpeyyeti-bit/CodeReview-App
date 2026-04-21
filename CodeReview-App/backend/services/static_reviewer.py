@@ -210,14 +210,24 @@ def _check_st_nmg_009(ctx: ReviewContext) -> list[Finding]:
 
 
 def _check_st_nmg_011(ctx: ReviewContext) -> list[Finding]:
-    """ST-NMG-011: DataTable Argument Prefix."""
+    """ST-NMG-011: DataTable Argument — flag DataTable args missing direction prefix.
+
+    Note: Per UiPath convention, arguments use ONLY direction prefixes
+    (in_, out_, io_) — never datatype prefixes like dt_. This rule
+    flags DataTable arguments that don't follow direction conventions.
+    """
     findings = []
+    direction_prefixes = {"In": "in_", "Out": "out_", "InOut": "io_"}
     for arg in ctx.arguments:
-        if "DataTable" in arg.type and not arg.name.startswith("dt_"):
+        if "DataTable" not in arg.type:
+            continue
+        expected = direction_prefixes.get(arg.direction, "in_")
+        if not arg.name.startswith(expected):
             findings.append(_make_finding(
-                ctx, "ST-NMG-011", "DataTable Argument Prefix", "MEDIUM", "Naming",
-                f"DataTable argument '{arg.name}' is missing the 'dt_' prefix.",
-                f"Rename to 'dt_{arg.name}'.",
+                ctx, "ST-NMG-011", "DataTable Argument Naming", "MEDIUM", "Naming",
+                f"DataTable argument '{arg.name}' (direction: {arg.direction}) is missing "
+                f"the '{expected}' prefix. Arguments use only direction prefixes, never datatype prefixes.",
+                f"Rename to '{expected}{arg.name}' to follow UiPath argument naming conventions.",
                 activity_path=f"Argument: {arg.name}",
                 auto_fixable=True,
             ))
