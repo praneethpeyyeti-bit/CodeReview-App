@@ -1,13 +1,13 @@
 # UiPath XAML Code Review App
 
-An AI-powered and static analysis code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 37 Workflow Analyzer rules, and auto-fix 5 naming convention violations.
+An AI-powered and static analysis code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 37 Workflow Analyzer rules, and auto-fix 6 rules (naming conventions, duplicate display names, unused variables).
 
 ## Features
 
 - **Static Analysis (No AI)** — Instant results from 36 rule checkers, no auth or Agent Units needed
 - **AI-Powered Review** — Deep analysis using Claude, GPT-4, Gemini via UiPath AI Trust Layer
 - **37 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, and general quality
-- **Auto-Fix 5 Rules** — Variable/argument prefix renaming and unused variable removal
+- **Auto-Fix 6 Rules** — Variable/argument prefix renaming, duplicate DisplayName rewrites (selector-derived), unused variable removal
 - **Side-by-Side Diff** — Preview all changes before accepting
 - **Folder Structure Preserved** — Fixed files maintain original ZIP directory layout
 - **Excel Export** — Styled report with executive summary, findings, per-file breakdown, and rule coverage
@@ -60,23 +60,24 @@ Navigate to [http://localhost:5173](http://localhost:5173)
 | Claude 3.7 Sonnet | 30-60 seconds | Yes | 37 (via prompt) | Yes |
 | GPT-4o / Gemini | 30-60 seconds | Yes | 37 (via prompt) | Yes |
 
-## Auto-Fix Rules (5)
+## Auto-Fix Rules (6)
 
-Only text-level operations — safe for UiPath Studio to open without errors.
+Text-level operations only — safe for UiPath Studio to open without errors.
 
 | Rule | What it Fixes | Method |
 |------|--------------|--------|
 | ST-NMG-001 | Add type prefix to variables (str_, int_, dt_, bln_, dtm_, ts_, arr_, dic_) | Regex rename |
 | ST-NMG-002 | Add direction prefix to arguments (in_, out_, io_) | Regex rename |
+| ST-NMG-004 | Rename duplicate DisplayNames using selector-derived labels (e.g. `Click 'Save'`); counter fallback | Positional attribute-value rewrite |
 | ST-NMG-009 | Add dt_ prefix to DataTable variables | Regex rename |
 | ST-NMG-011 | Add direction prefix (in_/out_/io_) to DataTable arguments | Regex rename |
 | GEN-001 | Remove unused variable declarations | XML element removal |
 
 After auto-fix, findings for fixed rules show `status = "Fixed"` in the review grid.
 
-### Detection-Only Rules (32)
+### Detection-Only Rules (31)
 
-The remaining 32 rules are detected and reported with specific recommendations, but require manual fix in UiPath Studio. UiPath's WPF-based XAML parser rejects programmatic insertion of elements with attributes — only text-level renames are safe.
+The remaining 31 rules are detected and reported with specific recommendations, but require manual fix in UiPath Studio. UiPath's WPF-based XAML parser rejects programmatic insertion of elements with attributes — only text-level renames and in-place attribute-value rewrites are safe.
 
 ## Rule Catalog (37 Unique Rules, 7 Categories)
 
@@ -85,7 +86,7 @@ The remaining 32 rules are detected and reported with specific recommendations, 
 |---------|-----------|:---:|
 | ST-NMG-001 | Variables Naming Convention | Yes |
 | ST-NMG-002 | Arguments Naming Convention | Yes |
-| ST-NMG-004 | Display Name Duplication | No |
+| ST-NMG-004 | Display Name Duplication | Yes |
 | ST-NMG-005 | Variable Overrides Variable | No |
 | ST-NMG-006 | Variable Overrides Argument | No |
 | ST-NMG-008 | Variable Length Exceeded | No |
@@ -160,7 +161,7 @@ backend/
     static_reviewer.py         # Static analysis engine (36 rule checker functions)
     llm_reviewer.py            # LLM invocation & batching
     xaml_parser.py             # Enhanced XAML parsing (properties, selectors, catch blocks, expressions)
-    xaml_fixer.py              # Auto-fix engine (5 rules)
+    xaml_fixer.py              # Auto-fix engine (6 rules)
     zip_extractor.py           # ZIP file handling
     token_refresh.py           # OAuth token auto-refresh
 

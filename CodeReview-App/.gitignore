@@ -17,6 +17,13 @@ backend/output/
 node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# Local test/debug artifacts
+*.bak
+backend/output/
+im_*.json
+auto_findings*.json
 
 # IDE
 .vscode/

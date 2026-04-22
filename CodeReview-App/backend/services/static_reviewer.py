@@ -141,8 +141,10 @@ def _check_st_nmg_004(ctx: ReviewContext) -> list[Finding]:
             findings.append(_make_finding(
                 ctx, "ST-NMG-004", "Display Name Duplication", "MEDIUM", "Naming",
                 f"Display name '{name}' is used {count} times. Each activity should have a unique name.",
-                "Assign unique, descriptive display names to each activity.",
+                "Assign unique, descriptive display names to each activity "
+                "(auto-fix derives names from each activity's selector when available).",
                 activity_path=f"DisplayName: {name}",
+                auto_fixable=True,
             ))
     return findings
 

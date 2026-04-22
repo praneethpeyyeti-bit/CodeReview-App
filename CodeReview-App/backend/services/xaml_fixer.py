@@ -4,9 +4,12 @@ Applies fixes for deterministic rules found during code review.
 Returns original and modified content with a list of changes applied.
 """
 
+import html
 import re
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from typing import Callable
+from xml.sax.saxutils import escape as _xml_escape
 
 from models.schemas import Finding
 
@@ -434,6 +437,204 @@ def _fix_gen_001(content: str, findings: list[Finding]) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 
 
+# ── ST-NMG-004: Rename duplicate DisplayNames with selector-derived labels ──
+
+_SELECTOR_PRIORITY = ("aaname", "innertext", "title", "name")
+_GENERIC_DISPLAY_NAMES = {
+    "Sequence", "Assign", "If", "Flowchart", "FlowDecision", "FlowStep",
+    "Body", "TryCatch", "Try", "Catch", "Finally",
+}
+
+
+def _local_tag(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _extract_selector_descriptor(selector: str) -> str | None:
+    """Pick the most meaningful descriptor from a UiPath selector string.
+
+    Prefers aaname > innertext > title > name on the most specific (last) node.
+    Falls back to regex when the selector isn't valid XML.
+    """
+    if not selector:
+        return None
+    sel = html.unescape(selector).strip()
+    if not sel:
+        return None
+
+    # Try structured parse first
+    try:
+        root = ET.fromstring(f"<root>{sel}</root>")
+        nodes = list(root)
+        for node in reversed(nodes):
+            for key in _SELECTOR_PRIORITY:
+                val = (node.attrib.get(key) or "").strip()
+                if val and val not in ("*",) and "*" not in val:
+                    return val
+    except ET.ParseError:
+        pass
+
+    # Regex fallback — pick the last occurrence of the highest-priority key
+    for key in _SELECTOR_PRIORITY:
+        matches = re.findall(rf"{key}\s*=\s*['\"]([^'\"]+)['\"]", sel)
+        for val in reversed(matches):
+            val = val.strip()
+            if val and val not in ("*",) and "*" not in val:
+                return val
+    return None
+
+
+def _sanitize_descriptor(descriptor: str) -> str:
+    """Trim whitespace, collapse newlines, cap length so names stay readable."""
+    d = re.sub(r"\s+", " ", descriptor).strip()
+    if len(d) > 40:
+        d = d[:37].rstrip() + "..."
+    return d
+
+
+def _build_unique_displayname(
+    type_name: str,
+    descriptor: str | None,
+    used_names: set[str],
+    fallback_counter: int,
+) -> str:
+    """Build a unique meaningful display name, with counter fallback."""
+    if descriptor:
+        desc = _sanitize_descriptor(descriptor)
+        if desc:
+            candidate = f"{type_name} '{desc}'"
+            if candidate not in used_names:
+                return candidate
+            i = 2
+            while f"{candidate} ({i})" in used_names:
+                i += 1
+            return f"{candidate} ({i})"
+    # No selector descriptor → numeric suffix
+    base = f"{type_name} ({fallback_counter})"
+    i = fallback_counter
+    while base in used_names:
+        i += 1
+        base = f"{type_name} ({i})"
+    return base
+
+
+def _find_activity_selector(elem: ET.Element) -> str:
+    """Look for a Selector attribute on the activity or its Target descendants."""
+    direct = elem.attrib.get("Selector") or ""
+    if direct:
+        return direct
+    for child in elem:
+        local = _local_tag(child.tag)
+        if local == "Target" or local.endswith(".Target"):
+            sel = child.attrib.get("Selector") or ""
+            if sel:
+                return sel
+            for gc in child:
+                if _local_tag(gc.tag) == "Target":
+                    sel = gc.attrib.get("Selector") or ""
+                    if sel:
+                        return sel
+    return ""
+
+
+def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
+    """ST-NMG-004: Rename duplicate DisplayNames.
+
+    Strategy:
+      1. Parse XAML with ET; collect activities in document order with their
+         DisplayName + selector.
+      2. Group by DisplayName; keep the first occurrence as-is and rename the
+         rest using a selector-derived descriptor when available, else a
+         numeric suffix.
+      3. Apply positional regex replacements on the raw text so the Nth
+         `DisplayName="X"` occurrence is replaced in place. Never re-serialize.
+    """
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Walk document order, collect (display_name, type_name, selector)
+    activities: list[tuple[str, str, str]] = []
+    for elem in root.iter():
+        dn = elem.attrib.get("DisplayName")
+        if dn is None:
+            continue
+        type_name = _local_tag(elem.tag)
+        if dn in _GENERIC_DISPLAY_NAMES:
+            continue
+        selector = _find_activity_selector(elem)
+        activities.append((dn, type_name, selector))
+
+    # Group activity indices by display name
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, (dn, _, _) in enumerate(activities):
+        groups[dn].append(i)
+
+    # Only act on names that appear >1 time (matching the reviewer's definition)
+    duplicates = {name: idxs for name, idxs in groups.items() if len(idxs) > 1}
+    if not duplicates:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Restrict to names flagged by the reviewer (safer + avoids unintended renames)
+    flagged_names: set[str] = set()
+    for f in findings:
+        # activity_path format: "DisplayName: {name}"
+        if f.activity_path.startswith("DisplayName:"):
+            flagged_names.add(f.activity_path.split(":", 1)[1].strip())
+        else:
+            # Description: "Display name '{name}' is used..."
+            m = re.search(r"Display name '([^']+)'", f.description)
+            if m:
+                flagged_names.add(m.group(1))
+    if flagged_names:
+        duplicates = {n: idxs for n, idxs in duplicates.items() if n in flagged_names}
+
+    if not duplicates:
+        return {"modified": False, "content": content, "changes": []}
+
+    used_names: set[str] = set(groups.keys())
+    replacements: list[tuple[int, int, str, str]] = []  # start, end, new_str, msg
+
+    for name, idxs in duplicates.items():
+        # Match the Nth DisplayName="{name}" in raw text. Use the attribute's
+        # XML-escaped form to align with the file.
+        escaped_attr = _xml_escape(name, {'"': '&quot;'})
+        pattern = re.compile(r'\bDisplayName="' + re.escape(escaped_attr) + r'"')
+        matches = list(pattern.finditer(content))
+        if len(matches) < len(idxs):
+            # Raw text has fewer matches than ET found — skip to stay safe.
+            continue
+
+        # Keep occurrence #1 (idxs[0]); rename occurrences #2..N.
+        for rank, idx in enumerate(idxs[1:], start=2):
+            _, type_name, selector = activities[idx]
+            descriptor = _extract_selector_descriptor(selector)
+            new_name = _build_unique_displayname(type_name, descriptor, used_names, rank)
+            used_names.add(new_name)
+            escaped_new = _xml_escape(new_name, {'"': '&quot;'})
+            m = matches[rank - 1]
+            replacements.append((
+                m.start(),
+                m.end(),
+                f'DisplayName="{escaped_new}"',
+                f"ST-NMG-004: Renamed duplicate DisplayName '{name}' -> '{new_name}' (occurrence #{rank})",
+            ))
+
+    if not replacements:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Apply in reverse so earlier offsets stay valid
+    replacements.sort(key=lambda r: r[0], reverse=True)
+    new_content = content
+    for start, end, new_str, _ in replacements:
+        new_content = new_content[:start] + new_str + new_content[end:]
+
+    # Show changes in document order (reverse of apply order)
+    changes = [msg for _, _, _, msg in sorted(replacements, key=lambda r: r[0])]
+    return {"modified": True, "content": new_content, "changes": changes}
+
+
 def _fix_st_dbp_003(content: str, findings: list[Finding]) -> dict:
     """ST-DBP-003: Add LogMessage to empty Catch blocks.
 
@@ -602,8 +803,9 @@ _FIX_HANDLERS: dict[str, Callable] = {
     "ST-NMG-002": _fix_st_nmg_002,
     "ST-NMG-009": _fix_st_nmg_009,
     "ST-NMG-011": _fix_st_nmg_011,
+    # Naming — auto-fixable (selector-derived rename)
+    "ST-NMG-004": _fix_st_nmg_004,
     # Naming — manual fix required
-    "ST-NMG-004": _noop_fix,
     "ST-NMG-005": _noop_fix,
     "ST-NMG-006": _noop_fix,
     "ST-NMG-008": _noop_fix,

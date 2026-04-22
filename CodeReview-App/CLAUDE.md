@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Full-stack code review tool for UiPath RPA XAML workflows. Features both **static analysis** (instant, no AI) and **AI-powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer). Analyzes workflows against 37 unique Workflow Analyzer rules across 7 categories and provides auto-fix for 5 rules.
+Full-stack code review tool for UiPath RPA XAML workflows. Features both **static analysis** (instant, no AI) and **AI-powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer). Analyzes workflows against 37 unique Workflow Analyzer rules across 7 categories and provides auto-fix for 6 rules.
 
 ## Architecture
 
@@ -48,7 +48,7 @@ backend/
     static_reviewer.py     # Static analysis engine (36 rule checker functions, no LLM)
     llm_reviewer.py        # LLM invocation, batching, JSON parsing
     xaml_parser.py          # XAML XML parsing -> ReviewContext (properties, selectors, catch blocks, expressions)
-    xaml_fixer.py           # Auto-fix engine (5 rules: naming prefixes + unused variable removal)
+    xaml_fixer.py           # Auto-fix engine (6 rules: naming prefixes, unused vars, duplicate DisplayName)
     zip_extractor.py        # ZIP file extraction
     token_refresh.py        # Background OAuth token refresh
   .env                     # UiPath tokens & config (auto-managed)
@@ -113,31 +113,32 @@ frontend/src/
 
 Note: Source Excel has 41 rows (some rules appear in multiple categories), but 37 unique rule IDs.
 
-## Auto-Fix Rules (5 Rules)
+## Auto-Fix Rules (6 Rules)
 
-Only text-level renames and element removal — never modifies XML structure or attributes.
+Text-level renames, element removal, and positional DisplayName rewrites. Never inserts elements or modifies attributes inside property-element contexts.
 
 | Rule | Fix | Method |
 |------|-----|--------|
 | ST-NMG-001 | Add type prefix to variables (str_, int_, dt_, bln_, dtm_, ts_, arr_, dic_) | Regex rename across all XAML locations |
 | ST-NMG-002 | Add direction prefix to arguments (in_, out_, io_) | Regex rename across all XAML locations |
+| ST-NMG-004 | Rename duplicate DisplayNames using selector-derived labels (e.g. `Click 'Save'`); counter fallback when no selector | Positional regex on the Nth `DisplayName="..."` occurrence |
 | ST-NMG-009 | Add dt_ prefix to DataTable variables | Regex rename |
 | ST-NMG-011 | Add direction prefix (in_/out_/io_) to DataTable arguments | Regex rename |
 | GEN-001 | Remove unused variable declarations | Remove self-closing `<Variable/>` element |
 
 After auto-fix, findings for fixed rules get `status = "Fixed"` in the review grid.
 
-### Why only 5 auto-fix rules?
+### Why only 6 auto-fix rules?
 
-UiPath uses a WPF-based XAML parser that is stricter than standard XML. Any modification that inserts elements with attributes (SimulateClick, LogMessage, Sequence) inside property element contexts causes `Unexpected ATTRIBUTE in NonemptyPropertyElement` parse errors in UiPath Studio. Only text-level renames and self-closing element removal are safe.
+UiPath uses a WPF-based XAML parser that is stricter than standard XML. **Inserting** elements with attributes (SimulateClick, LogMessage, Sequence) inside property-element contexts causes `Unexpected ATTRIBUTE in NonemptyPropertyElement` parse errors in UiPath Studio. Modifying an existing attribute value in place (like DisplayName) is safe when done on raw text — ET re-serialization drops xmlns declarations.
 
-**Detection-only rules (32):** Detected and reported with specific fix recommendations, but require manual fix in UiPath Studio.
+**Detection-only rules (31):** Detected and reported with specific fix recommendations, but require manual fix in UiPath Studio.
 
 ## Code Conventions
 
 - Backend uses Python type hints and Pydantic models
 - Frontend uses TypeScript strict mode with Tailwind CSS
-- XAML fixes must only do text-level renames or self-closing element removal — never insert elements or modify attributes
+- XAML fixes must operate on raw text (positional regex or string replacement) — never re-serialize via ET.tostring (drops xmlns). Never insert elements into property-element contexts.
 - Fixed files preserve the original ZIP folder structure (no `modified/` subfolder)
 - Static analysis returns `ReviewResponse` directly; LLM returns `job_id` for polling
 - Token refresh runs automatically in background
