@@ -23,6 +23,7 @@ class ActivitySummary(BaseModel):
     child_count: int = 0
     properties: dict[str, str] = {}
     is_inside_container: bool = False
+    is_structural_wrapper: bool = False
 
 
 class VariableSummary(BaseModel):
@@ -35,6 +36,7 @@ class ArgumentSummary(BaseModel):
     name: str
     direction: Literal["In", "Out", "InOut"]
     type: str
+    has_default: bool = False
 
 
 class CatchBlockSummary(BaseModel):

@@ -41,11 +41,19 @@ export default function ResultsPage() {
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [projectJson, setProjectJson] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [fixSummary, setFixSummary] = useState<{
+    totalChanges: number;
+    filesModified: number;
+    filesDeleted: number;
+    findingsFixed: number;
+    findingsUnmatched: number;
+  } | null>(null);
 
   const handleAutoFix = async () => {
     if (!reviewResponse || !lastFormData) return;
     setIsFixing(true);
     setError(null);
+    setFixSummary(null);
     try {
       const fixFd = new FormData();
       fixFd.append('project_name', reviewResponse.project_name);
@@ -57,17 +65,35 @@ export default function ResultsPage() {
       setProjectJson(res.project_json ?? null);
       setShowDiffView(true);
 
-      // Mark findings as "Fixed" if their rule was auto-fixed
-      if (res.fixed_rule_ids && res.fixed_rule_ids.length > 0) {
-        const fixedSet = new Set(res.fixed_rule_ids);
-        setFindings((prev) =>
-          prev.map((f) =>
-            f.auto_fixable && fixedSet.has(f.rule_id)
-              ? { ...f, status: 'Fixed' as const }
-              : f
-          )
-        );
+      let totalChanges = 0;
+      let filesModified = 0;
+      let filesDeleted = 0;
+      for (const f of res.files) {
+        if (f.delete) filesDeleted++;
+        if (f.changes.length > 0) filesModified++;
+        totalChanges += f.changes.length;
       }
+
+      // Mark every auto-fixable finding as Fixed. Rules are processed
+      // uniformly — the user asked to fix everything going forward.
+      let findingsFixed = 0;
+      setFindings((prev) =>
+        prev.map((f) => {
+          if (f.auto_fixable) {
+            findingsFixed++;
+            return { ...f, status: 'Fixed' as const };
+          }
+          return f;
+        })
+      );
+
+      setFixSummary({
+        totalChanges,
+        filesModified,
+        filesDeleted,
+        findingsFixed,
+        findingsUnmatched: 0,
+      });
     } catch (err: any) {
       setError(err.message ?? 'Auto-fix failed');
     } finally {
@@ -76,7 +102,7 @@ export default function ResultsPage() {
   };
 
   const handleFixAccepted = (path: string) => { setSavedPath(path); setShowDiffView(false); };
-  const handleNewReview = () => { clearReview(); navigate('/'); };
+  const handleNewReview = () => { clearReview(); navigate('/'); setFixSummary(null); };
 
   const filteredFindings = useMemo(() => {
     let result = findings;
@@ -136,7 +162,11 @@ export default function ResultsPage() {
         </button>
 
         {fixableCount > 0 && lastFormData && (
-          <button onClick={handleAutoFix} disabled={isFixing || findings.length === 0} className="btn-success">
+          <button
+            onClick={handleAutoFix}
+            disabled={isFixing || findings.length === 0}
+            className="btn-success"
+          >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
             </svg>
@@ -159,6 +189,25 @@ export default function ResultsPage() {
           </button>
         )}
       </div>
+
+      {fixSummary && !savedPath && (
+        <div className="px-5 py-3.5 bg-green-50 border border-green-200 rounded-2xl text-sm animate-fade-in">
+          <div className="flex items-start gap-2.5">
+            <svg className="w-5 h-5 flex-shrink-0 text-green-600 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div className="flex-1 text-green-900">
+              <p className="font-medium">
+                Applied <strong>{fixSummary.totalChanges}</strong> change{fixSummary.totalChanges === 1 ? '' : 's'} across{' '}
+                <strong>{fixSummary.filesModified}</strong> file{fixSummary.filesModified === 1 ? '' : 's'}
+                {fixSummary.filesDeleted > 0 && (
+                  <> · <strong>{fixSummary.filesDeleted}</strong> file{fixSummary.filesDeleted === 1 ? '' : 's'} marked for deletion</>
+                )}.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Active filters */}
       {(activeCategories.length > 0 || activeFile) && (

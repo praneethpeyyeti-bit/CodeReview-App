@@ -29,8 +29,9 @@ ST-NMG-005: Variable Overrides Variable — Variable shadowing in inner scopes. 
 ST-NMG-006: Variable Overrides Argument — Conflict between variable and argument names. Rename variables or arguments clearly.
 ST-NMG-008: Variable Length Exceeded — Variable name too long. Keep names concise, ideally under 20-30 characters.
 ST-NMG-009: Datatable Variable Prefix — Missing DataTable prefix. Use dt_ prefix for DataTables.
+ST-NMG-010: PascalCase Convention — Variable/argument body (the part after the prefix) is not PascalCase. No underscores in the body; first letter uppercase; words capitalized (e.g. str_customerName -> str_CustomerName, dt_sales_records -> dt_SalesRecords).
 ST-NMG-011: DataTable Argument Naming — DataTable argument missing direction prefix. Arguments use only direction prefixes (in_/out_/io_), never datatype prefixes.
-ST-NMG-012: Argument Default Values — Missing or incorrect default values. Assign appropriate default values.
+ST-NMG-012: Argument Default Values — In arguments that carry a default value. Out/InOut are ignored (they cannot have defaults). Defaults on In args hide coupling; callers should pass values explicitly.
 ST-NMG-016: Argument Length Exceeded — Argument name too long. Keep argument names short and meaningful.
 
 [CATEGORY: Design Best Practices | Severity: HIGH for structural, MEDIUM for style]
@@ -48,7 +49,6 @@ ST-DBP-028: Arguments Serialization — Arguments not serializable. Use serializ
 [CATEGORY: UI Automation | Severity: MEDIUM]
 UI-DBP-006: Container Usage — Improper use of UI containers. Use Attach or Use Application/Browser properly.
 UI-DBP-013: Excel Automation Misuse — Incorrect Excel activity usage. Use proper Excel scope activities.
-UI-DBP-030: Forbidden Variables in Selectors — Dynamic variables in selectors. Avoid or minimize dynamic selectors.
 UI-PRR-004: Hardcoded Delays — Static delays used in UI automation. Use WaitForReady or element-based waits.
 UI-REL-001: Large idx in Selectors — Unstable selectors using index. Use stable attributes instead of idx. (Severity: HIGH)
 UI-SEC-004: Sensitive Data in Selectors — Sensitive info in selectors. Mask or parameterize sensitive data. (Severity: CRITICAL)
@@ -143,7 +143,12 @@ IMPORTANT GUIDELINES — CONSISTENCY & ACCURACY:
 - EVIDENCE-BASED ONLY: Every finding MUST cite specific evidence from the provided context data (activity name, variable name, line reference, or property value). If you cannot point to concrete evidence, do NOT report the finding.
 - NO HALLUCINATION: Do NOT fabricate activity names, variable names, property values, or issues that are not present in the input data. Do NOT assume the existence of code elements not listed in the context.
 - NO PADDING: Do NOT generate findings just to produce output. If a workflow has no issues, return an empty findings array. Quality over quantity.
-- For naming rules (ST-NMG-001, ST-NMG-002, ST-NMG-009, ST-NMG-011), set auto_fixable to true as these can be safely renamed.
+- Set auto_fixable=true for these rules (the backend has deterministic fixers for them):
+  * Naming: ST-NMG-001, ST-NMG-002, ST-NMG-004, ST-NMG-005, ST-NMG-006, ST-NMG-008, ST-NMG-009, ST-NMG-010, ST-NMG-011, ST-NMG-012, ST-NMG-016
+  * Design Best Practices: ST-DBP-003 (auto-fix inserts a Log Message into empty catches), ST-DBP-023 (auto-fix deletes empty workflow files on accept)
+  * Reliability: GEN-REL-001 (self-closing empty sequences)
+  * General: GEN-001, GEN-003
+  For all other rules (including GEN-002), set auto_fixable=false (detection-only).
 - Use the exact category names: "Naming", "Design Best Practices", "UI Automation", "Performance", "Reliability", "Security", "General".
 - Prioritize CRITICAL and HIGH findings — these represent real risks. Do not pad with trivial INFO findings.
 - Cross-reference across files when checking for unused variables/arguments (GEN-001, GEN-002), project structure (GEN-004), and argument mismatches.

@@ -159,8 +159,9 @@ def _check_st_nmg_005(ctx: ReviewContext) -> list[Finding]:
                 ctx, "ST-NMG-005", "Variable Overrides Variable", "MEDIUM", "Naming",
                 f"Variable '{var.name}' is declared in multiple scopes: '{seen[var.name]}' and '{var.scope}'. "
                 "This causes variable shadowing.",
-                "Rename one of the variables to avoid confusion.",
+                "Rename one of the variables, or remove the inner-scope shadow (auto-fix keeps the outermost).",
                 activity_path=f"Variable: {var.name}",
+                auto_fixable=True,
             ))
         seen.setdefault(var.name, var.scope)
     return findings
@@ -176,8 +177,9 @@ def _check_st_nmg_006(ctx: ReviewContext) -> list[Finding]:
                 ctx, "ST-NMG-006", "Variable Overrides Argument", "HIGH", "Naming",
                 f"Variable '{var.name}' has the same name as argument '{arg_names[var.name.lower()]}'. "
                 "This can cause unexpected behavior.",
-                "Rename the variable or argument to be distinct.",
+                "Rename the variable or argument to be distinct (auto-fix removes the variable, retaining the argument).",
                 activity_path=f"Variable: {var.name}",
+                auto_fixable=True,
             ))
     return findings
 
@@ -190,8 +192,9 @@ def _check_st_nmg_008(ctx: ReviewContext) -> list[Finding]:
             findings.append(_make_finding(
                 ctx, "ST-NMG-008", "Variable Length Exceeded", "LOW", "Naming",
                 f"Variable '{var.name}' has {len(var.name)} characters, exceeding the recommended 30-character limit.",
-                "Shorten the variable name while keeping it meaningful.",
+                "Shorten the variable name while keeping it meaningful (auto-fix preserves prefix and drops middle words).",
                 activity_path=f"Variable: {var.name}",
+                auto_fixable=True,
             ))
     return findings
 
@@ -237,16 +240,106 @@ def _check_st_nmg_011(ctx: ReviewContext) -> list[Finding]:
 
 
 def _check_st_nmg_012(ctx: ReviewContext) -> list[Finding]:
-    """ST-NMG-012: Argument Default Values — flag Out/InOut without defaults."""
+    """ST-NMG-012: Argument Default Values — flag In arguments that carry defaults.
+
+    Out/InOut arguments cannot be given defaults in XAML (the workflow assigns
+    them), so this rule focuses on In arguments. A default value on an In
+    argument is a code smell: callers that rely on it get hidden coupling to
+    the workflow's internal "convenience" value.
+    """
     findings = []
     for arg in ctx.arguments:
-        if arg.direction in ("Out", "InOut") and arg.type in ("String", "System.String"):
-            findings.append(_make_finding(
-                ctx, "ST-NMG-012", "Argument Default Values", "INFO", "Naming",
-                f"Out/InOut argument '{arg.name}' (type: {arg.type}) — verify it has an appropriate default value.",
-                "Assign a default value to avoid null reference errors.",
-                activity_path=f"Argument: {arg.name}",
-            ))
+        if arg.direction != "In":
+            continue
+        if not arg.has_default:
+            continue
+        findings.append(_make_finding(
+            ctx, "ST-NMG-012", "Argument Default Values", "LOW", "Naming",
+            f"In argument '{arg.name}' has a default value. Callers should supply the value explicitly.",
+            "Remove the default; callers should always pass a value explicitly (auto-fix deletes the default-value block).",
+            activity_path=f"Argument: {arg.name}",
+            auto_fixable=True,
+        ))
+    return findings
+
+
+_PASCAL_PREFIXES = (
+    "in_str_", "in_int_", "in_bln_", "in_dt_", "in_dtm_", "in_ts_", "in_arr_", "in_dic_",
+    "out_str_", "out_int_", "out_bln_", "out_dt_", "out_dtm_", "out_ts_", "out_arr_", "out_dic_",
+    "io_str_", "io_int_", "io_bln_", "io_dt_", "io_dtm_", "io_ts_", "io_arr_", "io_dic_",
+    "in_", "out_", "io_",
+    "str_", "int_", "bln_", "dt_", "dtm_", "ts_", "arr_", "dic_",
+)
+
+
+def _split_known_prefix(name: str) -> tuple[str, str]:
+    """Split a variable/argument name into (prefix, body). Empty prefix if none match."""
+    for p in _PASCAL_PREFIXES:
+        if name.startswith(p):
+            return p, name[len(p):]
+    return "", name
+
+
+def _body_is_pascal_case(body: str) -> bool:
+    """True when the body part of a name is proper PascalCase.
+
+    Rules:
+      - Must not contain underscores
+      - Must start with an uppercase letter
+      - If the body is long (>= 10 chars) it must show word boundaries
+        (internal uppercase letters or digits). Long all-lowercase bodies like
+        'Filtercandidatedetailsfromsaptabledata' are treated as concatenated
+        words that still need word-splitting into PascalCase.
+    """
+    if not body:
+        return True
+    if "_" in body:
+        return False
+    if not body[0].isalpha() or not body[0].isupper():
+        return False
+    # Long bodies must show at least one internal word boundary.
+    if len(body) >= 10:
+        tail = body[1:]
+        has_boundary = any(c.isupper() or c.isdigit() for c in tail)
+        if not has_boundary:
+            return False
+    return True
+
+
+def _check_st_nmg_010(ctx: ReviewContext) -> list[Finding]:
+    """ST-NMG-010: PascalCase Convention for variable/argument bodies.
+
+    After the known prefix (str_, dt_, in_, out_, ...), the remaining body of
+    a variable or argument name must be PascalCase — starts with an uppercase
+    letter and contains no underscores.
+    """
+    findings = []
+    for var in ctx.variables:
+        prefix, body = _split_known_prefix(var.name)
+        if _body_is_pascal_case(body):
+            continue
+        findings.append(_make_finding(
+            ctx, "ST-NMG-010", "PascalCase Convention", "LOW", "Naming",
+            f"Variable '{var.name}' does not use PascalCase after the prefix "
+            f"('{prefix}' + body '{body}').",
+            "Rename to use PascalCase after the prefix "
+            "(auto-fix removes underscores in the body and capitalizes each word).",
+            activity_path=f"Variable: {var.name}",
+            auto_fixable=True,
+        ))
+    for arg in ctx.arguments:
+        prefix, body = _split_known_prefix(arg.name)
+        if _body_is_pascal_case(body):
+            continue
+        findings.append(_make_finding(
+            ctx, "ST-NMG-010", "PascalCase Convention", "LOW", "Naming",
+            f"Argument '{arg.name}' does not use PascalCase after the prefix "
+            f"('{prefix}' + body '{body}').",
+            "Rename to use PascalCase after the prefix "
+            "(auto-fix removes underscores in the body and capitalizes each word).",
+            activity_path=f"Argument: {arg.name}",
+            auto_fixable=True,
+        ))
     return findings
 
 
@@ -258,8 +351,9 @@ def _check_st_nmg_016(ctx: ReviewContext) -> list[Finding]:
             findings.append(_make_finding(
                 ctx, "ST-NMG-016", "Argument Length Exceeded", "LOW", "Naming",
                 f"Argument '{arg.name}' has {len(arg.name)} characters, exceeding the recommended 30-character limit.",
-                "Shorten the argument name while keeping it meaningful.",
+                "Shorten the argument name while keeping it meaningful (auto-fix preserves prefix and drops middle words).",
                 activity_path=f"Argument: {arg.name}",
+                auto_fixable=True,
             ))
     return findings
 
@@ -288,9 +382,9 @@ def _check_st_dbp_003(ctx: ReviewContext) -> list[Finding]:
                 ctx, "ST-DBP-003", "Empty Catch Block", "HIGH", "Design Best Practices",
                 f"Catch block for {cb.exception_type} has no handling logic. "
                 "Exceptions will be silently swallowed.",
-                "In Studio, add a Log Message (Level=Error) inside the Catch with Message: "
-                '"Exception: " & exception.GetType().Name & " - " & exception.Message & " | Source: " & exception.Source',
+                "Auto-fix inserts a Log Message (Level=Error) inside the Catch with exception type, message, and source.",
                 activity_path=f"Catch: {cb.exception_type}",
+                auto_fixable=True,
             ))
         elif not cb.has_log_message and cb.has_rethrow:
             findings.append(_make_finding(
@@ -341,7 +435,8 @@ def _check_st_dbp_023(ctx: ReviewContext) -> list[Finding]:
         return [_make_finding(
             ctx, "ST-DBP-023", "Empty Workflow", "MEDIUM", "Design Best Practices",
             "Workflow contains no meaningful activities.",
-            "Add activities or remove the empty workflow file.",
+            "Add activities or remove the empty workflow file (auto-fix deletes the file on accept).",
+            auto_fixable=True,
         )]
     return []
 
@@ -467,24 +562,6 @@ def _check_ui_dbp_013(ctx: ReviewContext) -> list[Finding]:
                     "Use 'Use Excel File' or 'Excel Application Scope' activity.",
                     activity_path=a.display_name,
                 ))
-    return findings
-
-
-def _check_ui_dbp_030(ctx: ReviewContext) -> list[Finding]:
-    """UI-DBP-030: Forbidden Variables in Selectors."""
-    findings = []
-    for a in ctx.activities:
-        selector = a.properties.get("Selector", "")
-        if selector and "[" in selector and "]" in selector:
-            # Has variable reference in selector
-            var_refs = re.findall(r'\[(\w+)\]', selector)
-            findings.append(_make_finding(
-                ctx, "UI-DBP-030", "Forbidden Variables in Selectors", "MEDIUM", "UI Automation",
-                f"Activity '{a.display_name}' has dynamic variable(s) in selector: {', '.join(var_refs)}. "
-                "Dynamic selectors are fragile and harder to maintain.",
-                "Minimize dynamic selectors. Use anchors or stable attributes instead.",
-                activity_path=a.display_name,
-            ))
     return findings
 
 
@@ -615,15 +692,20 @@ def _check_ui_prr_003(ctx: ReviewContext) -> list[Finding]:
 # ═══════════════════════════════════════════════════════════════════
 
 def _check_gen_rel_001(ctx: ReviewContext) -> list[Finding]:
-    """GEN-REL-001: Empty Sequences."""
+    """GEN-REL-001: Empty Sequences (standalone Sequence activities only).
+
+    Skip Sequences that are structural TryCatch wrappers (catch handler body or
+    Finally) — their emptiness is already covered by ST-DBP-003.
+    """
     findings = []
     for a in ctx.activities:
-        if a.type_name in ("Sequence", "NSequence") and a.child_count == 0 and a.depth > 0:
+        if a.type_name in ("Sequence", "NSequence") and a.child_count == 0 and a.depth > 0 and not a.is_structural_wrapper:
             findings.append(_make_finding(
                 ctx, "GEN-REL-001", "Empty Sequences", "MEDIUM", "Reliability",
                 f"Sequence '{a.display_name}' at depth {a.depth} has no child activities.",
-                "Remove the empty sequence or add the intended activities.",
+                "Remove the empty sequence or add the intended activities (auto-fix removes self-closing empty Sequence elements).",
                 activity_path=a.display_name,
+                auto_fixable=True,
             ))
     return findings
 
@@ -749,6 +831,7 @@ _RULES: list = [
     _check_st_nmg_006,
     _check_st_nmg_008,
     _check_st_nmg_009,
+    _check_st_nmg_010,
     _check_st_nmg_011,
     _check_st_nmg_012,
     _check_st_nmg_016,
@@ -764,7 +847,6 @@ _RULES: list = [
     _check_st_dbp_028,
     _check_ui_dbp_006,
     _check_ui_dbp_013,
-    _check_ui_dbp_030,
     _check_ui_prr_004,
     _check_ui_rel_001,
     _check_ui_sec_004,

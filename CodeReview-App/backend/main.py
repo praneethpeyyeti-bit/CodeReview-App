@@ -436,6 +436,7 @@ async def apply_fixes(
                 "original_content": item["content"],
                 "modified_content": item["content"],
                 "changes": [],
+                "delete": False,
             })
             continue
 
@@ -446,6 +447,7 @@ async def apply_fixes(
             "original_content": result["original_content"],
             "modified_content": result["modified_content"],
             "changes": result["changes_applied"],
+            "delete": result.get("delete", False),
         })
 
     # Collect rule IDs that were actually fixed (had changes applied)
@@ -457,11 +459,17 @@ async def apply_fixes(
             if parts:
                 fixed_rule_ids.add(parts[0].strip())
 
+    deleted_files = [
+        {"file_name": fr["file_name"], "zip_entry_path": fr["zip_entry_path"]}
+        for fr in fix_results if fr.get("delete")
+    ]
+
     return {
         "project_name": project_name,
         "files": fix_results,
         "project_json": project_json,
         "fixed_rule_ids": sorted(fixed_rule_ids),
+        "deleted_files": deleted_files,
     }
 
 
@@ -487,16 +495,32 @@ async def accept_fixes(request: Request):
     os.makedirs(base_dir, exist_ok=True)
 
     saved = 0
+    deleted = 0
     for item in file_list:
         file_name = item.get("file_name", "")
         zip_entry_path = item.get("zip_entry_path", "")
         modified_content = item.get("modified_content", "")
+        is_deleted = bool(item.get("delete", False))
         if not file_name:
             continue
 
         # Use zip_entry_path to preserve folder structure, fall back to file_name
         relative_path = zip_entry_path if zip_entry_path else file_name
         out_path = os.path.join(base_dir, relative_path)
+
+        if is_deleted:
+            # Remove any previously-saved copy of this file under output/
+            try:
+                if os.path.isfile(out_path):
+                    os.remove(out_path)
+                    deleted += 1
+                else:
+                    # Count as "to-be-deleted" so the UI reflects the intent even
+                    # when no prior copy exists on disk yet.
+                    deleted += 1
+            except OSError:
+                pass
+            continue
 
         # Create subdirectories as needed
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -520,4 +544,5 @@ async def accept_fixes(request: Request):
     return {
         "saved_path": os.path.abspath(base_dir),
         "file_count": saved,
+        "deleted_count": deleted,
     }

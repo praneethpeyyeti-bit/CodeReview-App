@@ -67,6 +67,12 @@ export interface FixFileResult {
   original_content: string;
   modified_content: string;
   changes: string[];
+  delete?: boolean;
+}
+
+export interface DeletedFileRef {
+  file_name: string;
+  zip_entry_path: string;
 }
 
 export interface FixResponse {
@@ -74,11 +80,13 @@ export interface FixResponse {
   files: FixFileResult[];
   project_json?: string | null;
   fixed_rule_ids?: string[];
+  deleted_files?: DeletedFileRef[];
 }
 
 export interface AcceptFixResponse {
   saved_path: string;
   file_count: number;
+  deleted_count?: number;
 }
 
 export async function submitFix(formData: FormData): Promise<FixResponse> {
@@ -92,7 +100,7 @@ export async function submitFix(formData: FormData): Promise<FixResponse> {
 
 export async function acceptFix(
   projectName: string,
-  files: { file_name: string; zip_entry_path?: string; modified_content: string }[],
+  files: { file_name: string; zip_entry_path?: string; modified_content: string; delete?: boolean }[],
   outputDir?: string,
   projectJson?: string | null
 ): Promise<AcceptFixResponse> {

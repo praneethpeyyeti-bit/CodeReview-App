@@ -21,7 +21,7 @@ const SEVERITY_ORDER: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']
 
 // All 41 Workflow Analyzer rules
 export const ALL_RULES: { rule_id: string; rule_name: string; category: FindingCategory }[] = [
-  // Naming (10)
+  // Naming (11)
   { rule_id: 'ST-NMG-001', rule_name: 'Variables Naming Convention', category: 'Naming' },
   { rule_id: 'ST-NMG-002', rule_name: 'Arguments Naming Convention', category: 'Naming' },
   { rule_id: 'ST-NMG-004', rule_name: 'Display Name Duplication', category: 'Naming' },
@@ -29,6 +29,7 @@ export const ALL_RULES: { rule_id: string; rule_name: string; category: FindingC
   { rule_id: 'ST-NMG-006', rule_name: 'Variable Overrides Argument', category: 'Naming' },
   { rule_id: 'ST-NMG-008', rule_name: 'Variable Length Exceeded', category: 'Naming' },
   { rule_id: 'ST-NMG-009', rule_name: 'Datatable Variable Prefix', category: 'Naming' },
+  { rule_id: 'ST-NMG-010', rule_name: 'PascalCase Convention', category: 'Naming' },
   { rule_id: 'ST-NMG-011', rule_name: 'DataTable Argument Naming', category: 'Naming' },
   { rule_id: 'ST-NMG-012', rule_name: 'Argument Default Values', category: 'Naming' },
   { rule_id: 'ST-NMG-016', rule_name: 'Argument Length Exceeded', category: 'Naming' },
@@ -43,10 +44,9 @@ export const ALL_RULES: { rule_id: string; rule_name: string; category: FindingC
   { rule_id: 'ST-DBP-026', rule_name: 'Delay Activity Usage', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-027', rule_name: 'Persistence Best Practice', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-028', rule_name: 'Arguments Serialization', category: 'Design Best Practices' },
-  // UI Automation (7)
+  // UI Automation (6)
   { rule_id: 'UI-DBP-006', rule_name: 'Container Usage', category: 'UI Automation' },
   { rule_id: 'UI-DBP-013', rule_name: 'Excel Automation Misuse', category: 'UI Automation' },
-  { rule_id: 'UI-DBP-030', rule_name: 'Forbidden Variables in Selectors', category: 'UI Automation' },
   { rule_id: 'UI-PRR-004', rule_name: 'Hardcoded Delays', category: 'UI Automation' },
   { rule_id: 'UI-REL-001', rule_name: 'Large idx in Selectors', category: 'UI Automation' },
   { rule_id: 'UI-SEC-004', rule_name: 'Sensitive Data in Selectors', category: 'UI Automation' },

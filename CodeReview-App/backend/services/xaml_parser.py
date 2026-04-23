@@ -86,36 +86,114 @@ def _extract_workflow_name(root: ET.Element, file_name: str) -> str:
 
 
 def _extract_variables(root: ET.Element) -> list[VariableSummary]:
+    """Extract Variable declarations with a **unique scope identifier** per
+    owning activity so shadowing between nested scopes can be detected.
+
+    A Variable lives inside a property element like `<Sequence.Variables>`;
+    the real owning activity is that property element's parent. We prefer the
+    owner's `WorkflowViewState.IdRef` for uniqueness; if absent we fall back
+    to `DisplayName` + path position so two Sequences with the same display
+    name still get distinct scopes.
+    """
+    # Build a parent map once so we can walk up two levels (Variable ->
+    # property element -> owning activity).
+    parent_map: dict[ET.Element, ET.Element] = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[child] = parent
+
+    # Assign each owner element a unique index so two structurally-similar
+    # Sequences (same tag name, same DisplayName, missing IdRef) still produce
+    # distinct scopes for their variables.
+    owner_ids: dict[int, str] = {}
     variables: list[VariableSummary] = []
+
     for elem in root.iter():
-        if _local_name(elem.tag) == "Variable":
-            name = elem.attrib.get("Name", "")
-            if not name:
-                continue
-            type_arg = ""
-            for attr_name, attr_val in elem.attrib.items():
-                if "TypeArguments" in attr_name:
-                    type_arg = attr_val
-                    break
-            if not type_arg:
-                type_arg = elem.attrib.get("Type", "String")
-            if ":" in type_arg:
-                type_arg = type_arg.split(":")[-1]
-            # Determine scope from parent element's DisplayName
-            scope = ""
-            parent = elem
-            # Walk up to find the activity that owns this variable
-            for p in root.iter():
-                for child in p:
-                    if child is elem:
-                        scope = p.attrib.get("DisplayName", _local_name(p.tag))
+        if _local_name(elem.tag) != "Variable":
+            continue
+        name = elem.attrib.get("Name", "")
+        if not name:
+            continue
+        type_arg = ""
+        for attr_name, attr_val in elem.attrib.items():
+            if "TypeArguments" in attr_name:
+                type_arg = attr_val
+                break
+        if not type_arg:
+            type_arg = elem.attrib.get("Type", "String")
+        if ":" in type_arg:
+            type_arg = type_arg.split(":")[-1]
+
+        # Walk up: Variable -> <Sequence.Variables> -> <Sequence>
+        prop_parent = parent_map.get(elem)
+        owner = parent_map.get(prop_parent) if prop_parent is not None else None
+
+        scope = ""
+        if owner is not None:
+            owner_key = id(owner)
+            if owner_key not in owner_ids:
+                # Prefer the owner's IdRef if present; else build a stable
+                # label from tag + DisplayName + a sequence counter.
+                ref_val = ""
+                for k, v in owner.attrib.items():
+                    if k.endswith("}IdRef") or k.endswith(":IdRef") or k == "IdRef":
+                        ref_val = v
                         break
-            variables.append(VariableSummary(name=name, type=type_arg, scope=scope))
+                if ref_val:
+                    owner_ids[owner_key] = ref_val
+                else:
+                    owner_tag = _local_name(owner.tag)
+                    display = owner.attrib.get("DisplayName", "")
+                    label = f"{owner_tag}:{display}" if display else owner_tag
+                    owner_ids[owner_key] = f"{label}#{len(owner_ids)}"
+            scope = owner_ids[owner_key]
+        elif prop_parent is not None:
+            scope = _local_name(prop_parent.tag)
+
+        variables.append(VariableSummary(name=name, type=type_arg, scope=scope))
     return variables
 
 
 def _extract_arguments(root: ET.Element) -> list[ArgumentSummary]:
     arguments: list[ArgumentSummary] = []
+
+    # First pass: collect argument names that carry a default value.
+    # UiPath serializes these two ways:
+    #   (a) ELEMENT-FORM: a property element like
+    #        <this:WorkflowName.argName><InArgument .../></this:WorkflowName.argName>
+    #   (b) ATTRIBUTE-FORM: a flattened attribute on the root Activity
+    #        <Activity this:WorkflowName.argName="some value" ...>
+    default_arg_names: set[str] = set()
+
+    # (a) Element-form defaults
+    for elem in root.iter():
+        local = _local_name(elem.tag)
+        if "." not in local:
+            continue
+        _, _, arg_name = local.partition(".")
+        if not arg_name or arg_name in ("Variables", "Triggers", "Resources", "Target", "DisplayName"):
+            continue
+        has_arg_child = False
+        for child in elem:
+            child_local = _local_name(child.tag)
+            if child_local in ("InArgument", "OutArgument", "InOutArgument"):
+                has_arg_child = True
+                break
+        if has_arg_child:
+            default_arg_names.add(arg_name)
+
+    # (b) Attribute-form defaults on the root Activity element.
+    # Attribute names have the form "{ns}ClassName.argName" after ET canonicalizes.
+    for attr_name in root.attrib.keys():
+        local_attr = attr_name.split("}")[-1] if "}" in attr_name else attr_name
+        if "." not in local_attr:
+            continue
+        _, _, arg_name = local_attr.partition(".")
+        if not arg_name or arg_name in ("Variables", "Triggers", "Resources", "Target", "DisplayName"):
+            continue
+        default_arg_names.add(arg_name)
+
+    # Second pass: build the argument list, marking which have defaults.
     for elem in root.iter():
         if _local_name(elem.tag) == "Property":
             name = elem.attrib.get("Name", "")
@@ -140,7 +218,12 @@ def _extract_arguments(root: ET.Element) -> list[ArgumentSummary]:
                 inner_type = match.group(1)
                 if ":" in inner_type:
                     inner_type = inner_type.split(":")[-1]
-            arguments.append(ArgumentSummary(name=name, direction=direction, type=inner_type))
+            arguments.append(ArgumentSummary(
+                name=name,
+                direction=direction,
+                type=inner_type,
+                has_default=name in default_arg_names,
+            ))
     return arguments
 
 
@@ -207,15 +290,24 @@ def _extract_catch_blocks(root: ET.Element) -> list[CatchBlockSummary]:
                     exc_type = attr_val.split(":")[-1] if ":" in attr_val else attr_val
                     break
 
-            # Count activities inside the catch block
+            # Count activities inside the catch block.
+            # Every <Catch> wraps its handler in
+            #   <ActivityAction><ActivityAction.Argument/><Sequence>...</Sequence></ActivityAction>
+            # The wrapping ActivityAction and Sequence are *structural* — they exist
+            # even when the catch is empty — so we must not count them. We also
+            # skip the Body/NSequence variants and any Flowchart container node.
             activity_count = 0
             has_log = False
             has_rethrow = False
+            structural_containers = {
+                "ActivityAction", "DelegateInArgument", "Catch",
+                "Sequence", "NSequence", "Body", "Flowchart",
+            }
             for descendant in elem.iter():
                 desc_local = _local_name(descendant.tag)
                 if desc_local in _META_ELEMENTS or "." in desc_local:
                     continue
-                if desc_local in ("ActivityAction", "DelegateInArgument", "Catch"):
+                if desc_local in structural_containers:
                     continue
                 if "Dictionary" in desc_local or "Collection" in desc_local:
                     continue
@@ -343,6 +435,17 @@ def parse_xaml_file(
         child_count = _count_activity_children(elem)
         props = _extract_properties(elem)
 
+        # Mark only Catch-handler body Sequences (direct children of
+        # ActivityAction) as structural. Those are always present even for
+        # empty handlers and are instead covered by ST-DBP-003. Sequences
+        # inside TryCatch.Try / TryCatch.Finally are user-authored — an empty
+        # Finally (or empty Try) should still be flagged by GEN-REL-001.
+        is_structural = False
+        if local in ("Sequence", "NSequence"):
+            parent = parent_map.get(elem)
+            if parent is not None and _local_name(parent.tag) == "ActivityAction":
+                is_structural = True
+
         activities_raw.append(
             {"type_name": local, "display_name": display_name, "depth": depth}
         )
@@ -355,6 +458,7 @@ def parse_xaml_file(
             child_count=child_count,
             properties=props,
             is_inside_container=inside_container,
+            is_structural_wrapper=is_structural,
         ))
 
     variables = _extract_variables(root)

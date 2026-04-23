@@ -149,14 +149,19 @@ export default function DiffViewer({ projectName, files, projectJson, onClose, o
     setError(null);
     setShowOutputPrompt(false);
     try {
-      const filesToSave = files.map((f) => ({
-        file_name: f.file_name,
-        zip_entry_path: f.zip_entry_path || '',
-        modified_content:
-          f.changes.length > 0 && !excludedFiles.has(f.file_name)
-            ? f.modified_content
-            : f.original_content,
-      }));
+      const filesToSave = files.map((f) => {
+        const excluded = excludedFiles.has(f.file_name);
+        const willDelete = Boolean(f.delete) && !excluded;
+        return {
+          file_name: f.file_name,
+          zip_entry_path: f.zip_entry_path || '',
+          modified_content:
+            !willDelete && f.changes.length > 0 && !excluded
+              ? f.modified_content
+              : f.original_content,
+          delete: willDelete,
+        };
+      });
       const res = await acceptFix(projectName, filesToSave, outputDir || undefined, projectJson);
       onAccepted(res.saved_path);
     } catch (err: any) {
@@ -188,8 +193,19 @@ export default function DiffViewer({ projectName, files, projectJson, onClose, o
           <div>
             <h2 className="text-white font-semibold text-base">Auto-Fix Preview — Side by Side</h2>
             <p className="text-gray-400 text-xs mt-0.5">
-              {files.filter((f) => f.changes.length > 0 && !excludedFiles.has(f.file_name)).length} of {files.length} files will be modified
-              {excludedFiles.size > 0 && ` (${excludedFiles.size} excluded)`}
+              {(() => {
+                const included = files.filter((f) => !excludedFiles.has(f.file_name));
+                const modified = included.filter((f) => f.changes.length > 0).length;
+                const deleted = included.filter((f) => f.delete).length;
+                const totalChanges = included.reduce((s, f) => s + f.changes.length, 0);
+                return (
+                  <>
+                    {totalChanges} change{totalChanges === 1 ? '' : 's'} across {modified} of {files.length} files
+                    {deleted > 0 && ` · ${deleted} to delete`}
+                    {excludedFiles.size > 0 && ` · ${excludedFiles.size} excluded`}
+                  </>
+                );
+              })()}
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -255,6 +271,7 @@ export default function DiffViewer({ projectName, files, projectJson, onClose, o
           <div className="w-56 border-r border-ui-g200 overflow-y-auto bg-ui-g50 flex-shrink-0">
             {files.map((f, idx) => {
               const fileExcluded = excludedFiles.has(f.file_name);
+              const willDelete = Boolean(f.delete);
               return (
                 <div
                   key={f.file_name}
@@ -268,7 +285,7 @@ export default function DiffViewer({ projectName, files, projectJson, onClose, o
                     onClick={() => setActiveFileIndex(idx)}
                     className="w-full text-left px-4 pt-3 pb-1 text-sm"
                   >
-                    <div className={`truncate ${fileExcluded ? 'text-ui-g400 line-through' : 'text-ui-g700 font-medium'}`}>{f.file_name}</div>
+                    <div className={`truncate ${fileExcluded ? 'text-ui-g400 line-through' : willDelete ? 'text-red-700 font-medium' : 'text-ui-g700 font-medium'}`}>{f.file_name}</div>
                   </button>
                   <div className="px-4 pb-2 text-xs">
                     {f.changes.length > 0 ? (
@@ -279,8 +296,8 @@ export default function DiffViewer({ projectName, files, projectJson, onClose, o
                           onChange={() => toggleFileExclusion(f.file_name)}
                           className="accent-ui-orange w-3.5 h-3.5"
                         />
-                        <span className={fileExcluded ? 'text-ui-g400 line-through' : 'text-green-600'}>
-                          {f.changes.length} fix(es)
+                        <span className={fileExcluded ? 'text-ui-g400 line-through' : willDelete ? 'text-red-600 font-medium' : 'text-green-600'}>
+                          {willDelete ? 'Will be deleted' : `${f.changes.length} fix(es)`}
                         </span>
                       </label>
                     ) : (
