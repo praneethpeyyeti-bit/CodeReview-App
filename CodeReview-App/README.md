@@ -17,7 +17,7 @@ An AI-powered and static analysis code review tool for UiPath RPA workflows. Upl
 
 - **Python** >= 3.11
 - **Node.js** >= 18
-- **UiPath CLI** (optional) — Only needed for AI model review (`uipath auth`)
+- **UiPath CLI** — Required for AI-powered review. Installed automatically with `pip install -r requirements.txt` (bundled with `uipath-langchain`). See [AI-Powered Review Setup](#ai-powered-review-setup-optional) for the one-time `uipath auth` step.
 
 ## Quick Start
 
@@ -40,6 +40,63 @@ npm run dev
 ### 3. Open the App
 
 Navigate to [http://localhost:5173](http://localhost:5173)
+
+## AI-Powered Review Setup (optional)
+
+Skip this section if you only use Static Analysis — it needs no UiPath credentials.
+
+For AI mode (Claude / GPT-4o / Gemini via the UiPath AI Trust Layer), the
+backend needs an access token plus a refresh token tied to **your** UiPath
+tenant. The repo gitignores `backend/.env` and `backend/.uipath/.auth.json`
+on purpose, so every new clone has to authenticate once.
+
+### First-time setup
+
+1. Install dependencies (this also installs the `uipath` CLI):
+
+   ```bash
+   cd backend
+   pip install -r requirements.txt
+   ```
+
+2. Authenticate with UiPath Cloud (opens a browser):
+
+   ```bash
+   # IMPORTANT: run this from the backend/ directory. The backend looks for
+   # .uipath/.auth.json relative to backend/, so running uipath auth from the
+   # repo root will write the tokens to the wrong place.
+   uipath auth
+   ```
+
+   This creates `backend/.uipath/.auth.json` and populates `backend/.env`
+   with `UIPATH_URL`, `UIPATH_ACCESS_TOKEN`, `UIPATH_TENANT_ID`, etc. for
+   your tenant.
+
+3. Verify:
+
+   ```bash
+   ls backend/.uipath/.auth.json        # should exist
+   grep UIPATH_URL backend/.env         # should show your org URL
+   ```
+
+4. Start the backend and hit the health endpoint:
+
+   ```bash
+   curl http://127.0.0.1:8000/api/health
+   ```
+
+   A successful response includes
+   `"token": {"valid": true, "expires_in_minutes": 60, "auto_refresh": true}`.
+   The backend refreshes the access token automatically once it's set up.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `No refresh_token found in .auth.json — cannot auto-refresh` in logs | `uipath auth` was run from the repo root, not from `backend/` | Move `CodeReview-App/.uipath/` → `CodeReview-App/backend/.uipath/`, or re-run `uipath auth` from inside `backend/` |
+| `token: {"valid": false}` on `/api/health` | Token expired and no refresh token available | Re-run `uipath auth` from `backend/` |
+| AI review returns 401/403 | Access token is valid but your tenant doesn't have the selected model enabled | Try a different model (`/api/models` shows what's available for your tenant), or ask your tenant admin to enable the AI Trust Layer for that model |
+| `command not found: uipath` | `pip install -r requirements.txt` didn't complete successfully | Re-run the install, confirm no errors, then `which uipath` |
 
 ## Usage
 
