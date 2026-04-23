@@ -24,6 +24,21 @@ frontend/tsconfig.tsbuildinfo
 backend/output/
 im_*.json
 auto_findings*.json
+rv*.json
+fx*.json
+f[0-9]*.json
+r.json
+f.json
+auto.json
+accept.json
+verify.json
+crt*.json
+_aud/
+_crt/
+_deltest/
+_emptyout/
+_nmg12test/
+_oldtest/
 
 # IDE
 .vscode/
