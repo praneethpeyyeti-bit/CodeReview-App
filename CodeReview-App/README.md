@@ -1,13 +1,13 @@
 # UiPath XAML Code Review App
 
-An AI-powered and static analysis code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 37 Workflow Analyzer rules, and auto-fix 16 rules (naming conventions, PascalCase, duplicate display names, shadows, length limits, argument defaults, empty catches, empty sequences, unused variables).
+An AI-powered and static analysis code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 38 Workflow Analyzer rules, and auto-fix 17 rules (naming conventions, PascalCase, duplicate display names, default-Studio-name rewrites, shadows, length limits, argument defaults, empty catches, empty sequences, unused variables).
 
 ## Features
 
-- **Static Analysis (default)** — Instant, deterministic results from 36 rule checkers. No UiPath auth, no Agent Units, byte-stable output across runs.
+- **Static Analysis (default)** — Instant, deterministic results from 37 rule checkers. No UiPath auth, no Agent Units, byte-stable output across runs.
 - **AI-Powered Review (opt-in)** — Deep analysis via Claude / GPT-4o / Gemini through UiPath AI Trust Layer. `temperature=0` + `seed=42` + submission-order batch collection + deterministic post-sort → same input ⇒ same output.
-- **37 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, general quality
-- **Auto-Fix 16 Rules with Convergence Loop** — The fix pipeline runs up to 5 passes with a static re-review between passes, so cascades like `prefix add → length overflow → PascalCase → word-split shorten` converge automatically in a single `/api/fix` call
+- **38 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, general quality
+- **Auto-Fix 17 Rules with Convergence Loop** — The fix pipeline runs up to 5 passes with a static re-review between passes, so cascades like `prefix add → length overflow → PascalCase → word-split shorten → default-name rewrite using final names` converge automatically in a single `/api/fix` call
 - **Side-by-Side Diff** — Preview all changes before accepting
 - **Folder Structure Preserved** — Fixed files maintain original ZIP directory layout
 - **Excel Export** — Styled report with executive summary, findings, per-file breakdown, rule coverage
@@ -115,13 +115,13 @@ on purpose, so every new clone has to authenticate once.
 
 | Mode | Default | Speed | Auth Required | Rules | Agent Units |
 |------|:---:|-------|:---:|:---:|:---:|
-| Static Analysis | ✅ | < 1 second | No | 36 checkers | None |
-| Claude 3.7 Sonnet | — | 30-60 seconds | Yes | 37 (via prompt) | Yes |
-| GPT-4o / Gemini | — | 30-60 seconds | Yes | 37 (via prompt) | Yes |
+| Static Analysis | ✅ | < 1 second | No | 37 checkers | None |
+| Claude 3.7 Sonnet | — | 30-60 seconds | Yes | 38 (via prompt) | Yes |
+| GPT-4o / Gemini | — | 30-60 seconds | Yes | 38 (via prompt) | Yes |
 
 Direct API callers that omit `model_id` get static analysis. The UI toggle also opens on Static.
 
-## Auto-Fix Rules (16)
+## Auto-Fix Rules (17)
 
 Text-level operations on raw XAML — safe for UiPath Studio to open without errors.
 
@@ -138,6 +138,7 @@ Text-level operations on raw XAML — safe for UiPath Studio to open without err
 | ST-NMG-011 | Add direction prefix (`in_`/`out_`/`io_`) to DataTable arguments | Regex rename |
 | ST-NMG-012 | Remove default values for **In** arguments (Out/InOut skipped). Handles both element-form (`<this:Main.arg>...</this:Main.arg>`) and attribute-form (`this:Main.arg="value"` on root) | Element removal + attribute strip |
 | ST-NMG-016 | Shorten argument name > 30 chars | Regex rename |
+| ST-NMG-020 | Rename activities still using the Studio default DisplayName (e.g. `Click` → `Click 'Save'` from selector, `Assign` → `Assign 'to str_Customer'` from `Assign.To`, `LogMessage` → `LogMessage 'Order processed'` from Message). Runs LAST in the NMG tier so descriptors reference final variable/argument names | ET-guided + positional regex (insert or replace DisplayName) |
 | ST-DBP-003 | Insert `<ui:LogMessage Level="Error">` inside empty Catch body (includes exception type, message, source). Auto-adds `xmlns:ui` on the Activity root if missing | ET-guided + positional insertion |
 | ST-DBP-023 | Delete empty workflow file on accept | File-level deletion via fix-response `delete` flag |
 | GEN-001 | Remove unused `<Variable/>` declarations | Element removal |
@@ -154,9 +155,9 @@ The remaining 21 rules are detected and reported with specific recommendations, 
 - **Fix execution order**: the backend runs removal rules (shadow, unused variable, argument default, empty catch, empty workflow) **before** rename rules (ST-NMG-001/002/004/008/009/010/011/016). Otherwise a rename would target names that should have been deleted, or stale attribute references like `this:Main.oldName="value"` would survive after a rename.
 - **Attribute-form argument defaults**: UiPath serializes some argument defaults as attributes on the root Activity (e.g., `<Activity this:Main.argName="value">`). The parser detects both this form and the element-form `<this:Main.argName>...</this:Main.argName>`. Both are detected for ST-NMG-012 and correctly updated when renames happen.
 
-## Rule Catalog (37 Unique Rules, 7 Categories)
+## Rule Catalog (38 Unique Rules, 7 Categories)
 
-### Naming (ST-NMG) — 11 rules
+### Naming (ST-NMG) — 12 rules
 | Rule ID | Rule Name | Auto-Fix |
 |---------|-----------|:---:|
 | ST-NMG-001 | Variables Naming Convention | Yes |
@@ -170,6 +171,7 @@ The remaining 21 rules are detected and reported with specific recommendations, 
 | ST-NMG-011 | DataTable Argument Naming | Yes |
 | ST-NMG-012 | Argument Default Values | Yes |
 | ST-NMG-016 | Argument Length Exceeded | Yes |
+| ST-NMG-020 | Default Studio Display Name | Yes |
 
 ### Design Best Practices (ST-DBP) — 10 rules
 | Rule ID | Rule Name | Auto-Fix |
@@ -223,7 +225,7 @@ The remaining 21 rules are detected and reported with specific recommendations, 
 | GEN-004 | Project Structure Issues | No |
 | GEN-005 | Package Restrictions | No |
 
-Note: Source Excel has 41 rows (some rules listed in multiple categories), plus ST-NMG-010 added locally for PascalCase enforcement — 37 unique rule IDs.
+Note: Source Excel has 41 rows (some rules listed in multiple categories), plus ST-NMG-010 (PascalCase enforcement) and ST-NMG-020 (Default Studio Display Name) added locally — 38 unique rule IDs.
 
 ## Project Structure
 
@@ -233,7 +235,7 @@ backend/
   models/schemas.py            # Pydantic data models
   prompts/code_review_prompt.py # LLM system prompt (AI mode only)
   services/
-    static_reviewer.py         # Static analysis engine (36 rule checker functions)
+    static_reviewer.py         # Static analysis engine (37 rule checker functions)
     llm_reviewer.py            # LLM invocation & batching
     xaml_parser.py             # Enhanced XAML parsing (properties, selectors, catch blocks, expressions)
     xaml_fixer.py              # Auto-fix engine (6 rules)
@@ -248,7 +250,7 @@ frontend/src/
   components/                  # UploadZone, SummaryPanel, ReviewGrid, DiffViewer, etc.
   services/
     apiClient.ts               # API client (sync + async polling)
-    excelExporter.ts           # Excel report (37 rules, 7 categories)
+    excelExporter.ts           # Excel report (38 rules, 7 categories)
 ```
 
 ## Tech Stack

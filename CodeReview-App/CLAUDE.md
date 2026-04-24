@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Full-stack code review tool for UiPath RPA XAML workflows. **Static analysis is the default** — deterministic, instant, zero auth, zero agent units. **AI-Powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer) is opt-in per request. Both modes cover the same 37 unique Workflow Analyzer rules across 7 categories; auto-fix handles 16 rules (including file-level deletion of empty workflows).
+Full-stack code review tool for UiPath RPA XAML workflows. **Static analysis is the default** — deterministic, instant, zero auth, zero agent units. **AI-Powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer) is opt-in per request. Both modes cover the same 38 unique Workflow Analyzer rules across 7 categories; auto-fix handles 17 rules (including file-level deletion of empty workflows and renaming activities still using Studio default names).
 
 ## Architecture
 
@@ -45,7 +45,7 @@ backend/
   models/schemas.py        # Pydantic models (Finding, ReviewContext, ActivitySummary, etc.)
   prompts/code_review_prompt.py  # LLM system prompt (used only with AI models)
   services/
-    static_reviewer.py     # Static analysis engine (36 rule checker functions, no LLM)
+    static_reviewer.py     # Static analysis engine (37 rule checker functions, no LLM)
     llm_reviewer.py        # LLM invocation, batching, JSON parsing
     xaml_parser.py          # XAML XML parsing -> ReviewContext (properties, selectors, catch blocks, expressions)
     xaml_fixer.py           # Auto-fix engine (15 rules: naming, duplicate DisplayName, shadows, length, defaults, empty catch, empty sequences, unused vars/args)
@@ -91,7 +91,7 @@ frontend/src/
 - The **default** for both the UI (toggle opens on Static) and the API (POST `/api/review` with no `model_id` runs static)
 - Returns results instantly (< 1 second) — sync response, no job polling
 - Zero UiPath auth, zero Agent Units
-- 36 rule checker functions run deterministically on parsed XAML data
+- 37 rule checker functions run deterministically on parsed XAML data
 - Backed by `DEFAULT_MODE = "static"` in [main.py](backend/main.py); `/api/models` exposes `"default": "static"` + `"default_ai_model": "<claude-id>"`
 
 ### AI-Powered Review (opt-in)
@@ -105,7 +105,7 @@ frontend/src/
 
 | Category | Prefix | Count | Rules |
 |----------|--------|:-----:|-------|
-| Naming | ST-NMG-* | 11 | Variable/argument prefixes, PascalCase body, length, duplication, shadowing, name collisions, defaults |
+| Naming | ST-NMG-* | 12 | Variable/argument prefixes, PascalCase body, length, duplication, shadowing, name collisions, defaults, default-Studio-name detection |
 | Design Best Practices | ST-DBP-* | 10 | Empty catch, high arg count, nested flowcharts, undefined outputs, empty workflow, persistence, serialization, delays |
 | UI Automation | UI-DBP-*, UI-PRR-004, UI-REL-001, UI-SEC-* | 6 | Container usage, Excel scope, hardcoded delays, idx in selectors, sensitive data |
 | Performance | UI-PRR-* | 3 | Simulate click/type, application reuse |
@@ -113,9 +113,9 @@ frontend/src/
 | Security | UI-SEC-*, UX-DBP-029 | 3 | Sensitive data exposure, unauthorized apps, insecure passwords |
 | General | GEN-* | 5 | Unused variables/arguments, empty sequences, project structure, package restrictions |
 
-Note: Source Excel has 41 rows (some rules appear in multiple categories), plus ST-NMG-010 added locally for PascalCase enforcement — 37 unique rule IDs.
+Note: Source Excel has 41 rows (some rules appear in multiple categories), plus ST-NMG-010 (PascalCase enforcement) and ST-NMG-020 (Default Studio Display Name) added locally — 38 unique rule IDs.
 
-## Auto-Fix Rules (16 Rules)
+## Auto-Fix Rules (17 Rules)
 
 Text-level operations on raw XAML — regex rename, positional attribute-value rewrite, element removal, or contained-insertion inside `<Catch>` delegate bodies. Never inserts elements with attributes into property-element contexts (which corrupts UiPath's WPF XAML parser).
 
@@ -132,6 +132,7 @@ Text-level operations on raw XAML — regex rename, positional attribute-value r
 | ST-NMG-011 | Add direction prefix (`in_`/`out_`/`io_`) to DataTable arguments | Regex rename |
 | ST-NMG-012 | Remove default-value for **In** arguments (Out/InOut are ignored since they can't have defaults). Handles both element-form `<this:WfName.argName>...</...>` and attribute-form `this:WfName.argName="..."` on the Activity root | Element removal + attribute stripping |
 | ST-NMG-016 | Shorten argument name > 30 chars | Regex rename |
+| ST-NMG-020 | Rename activities still using the Studio default DisplayName (missing or equals type name). UI activities use selector content; non-UI use type-specific descriptors (Assign target variable, LogMessage text, InvokeWorkflowFile filename, Delay duration, If/While condition, etc.). Activities with no derivable descriptor are skipped. Runs LAST in the NMG tier so descriptors reflect the final post-rename, post-shorten variable/argument names | ET-guided discovery + positional regex (insert if no DisplayName, replace if DisplayName=type) |
 | ST-DBP-003 | Insert `<ui:LogMessage Level="Error">` inside the empty Catch body Sequence (includes exception type, message, source). Auto-injects `xmlns:ui` on the Activity root when not already declared | ET-guided discovery + positional regex insertion before `</Sequence>` |
 | ST-DBP-023 | Delete empty workflow file on accept | File deletion via `delete` flag (fix response) + `os.remove()` in `/api/fix/accept` |
 | GEN-001 | Remove unused `<Variable/>` declarations | Element removal |
@@ -142,6 +143,15 @@ After auto-fix, findings for fixed rules get `status = "Fixed"` in the review gr
 ### Detection-only rules (21)
 The remaining 21 rules (ST-DBP-002/007/020/024/025/026/027/028, UI-DBP-006/013, UI-PRR-001/002/003/004, UI-REL-001, UI-SEC-004/010, UX-DBP-029, GEN-002, GEN-004/005) are detected with specific recommendations but require manual fix. UiPath's WPF-based XAML parser rejects programmatic insertion of elements-with-attributes inside property-element contexts — that's what blocks auto-fix for most UI-side rules.
 
+### Activity-naming rules at a glance
+
+| Rule | What it flags | What auto-fix does |
+|---|---|---|
+| ST-NMG-004 | Same DisplayName used by 2+ activities | Renames the 2nd..Nth occurrence using selector or type-specific descriptors |
+| ST-NMG-020 | Activity uses Studio default name (missing or equals type) | Inserts/replaces DisplayName using selector or type-specific descriptors |
+
+Both rules can apply to the same activity (e.g., 3 Assigns all named "Assign" → ST-NMG-004 flags 1 finding for the duplication, ST-NMG-020 flags 3 findings for default-naming). The fixer runs ST-NMG-020 last so its descriptors pull from finalized variable/argument names.
+
 ### Fix pipeline ordering
 
 `_rule_priority()` in [xaml_fixer.py](backend/services/xaml_fixer.py) controls execution order. The tiers are:
@@ -151,8 +161,9 @@ The remaining 21 rules (ST-DBP-002/007/020/024/025/026/027/028, UI-DBP-006/013, 
 3. **Priority 2** — Prefix renames: ST-NMG-001/002/009/011 — add `str_`/`in_`/`out_`/`io_`/`dt_` before downstream rules see them
 4. **Priority 3** — Case correction: ST-NMG-010 — splits concatenated lowercase runs via wordninja and PascalCases
 5. **Priority 4** — Length shortening: ST-NMG-008/016 — runs last on properly-cased names so it can drop whole middle words instead of naively truncating
-6. **Priority 5** — Remaining NMG rules (e.g. ST-NMG-004)
-7. **Priority 6-7** — UI Automation / Performance / Reliability / General
+6. **Priority 5** — Default-name rewrite: ST-NMG-020 — runs LAST in the NMG tier so its descriptors (which pull from `<Assign.To>`, `Message`, etc.) reference the final post-rename variable/argument names
+7. **Priority 6** — Remaining NMG rules (e.g. ST-NMG-004)
+8. **Priority 7-8** — UI Automation / Performance / Reliability / General
 
 Example: if ST-NMG-002 ran before ST-NMG-012, renaming `Name="test"` to `Name="in_test"` would happen first, but the attribute-form default `this:Main.test="value"` would still reference the old name. ST-NMG-012 removes the default attribute first so the subsequent rename applies cleanly.
 

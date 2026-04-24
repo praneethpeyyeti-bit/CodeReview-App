@@ -33,6 +33,7 @@ ST-NMG-010: PascalCase Convention — Variable/argument body (the part after the
 ST-NMG-011: DataTable Argument Naming — DataTable argument missing direction prefix. Arguments use only direction prefixes (in_/out_/io_), never datatype prefixes.
 ST-NMG-012: Argument Default Values — In arguments that carry a default value. Out/InOut are ignored (they cannot have defaults). Defaults on In args hide coupling; callers should pass values explicitly.
 ST-NMG-016: Argument Length Exceeded — Argument name too long. Keep argument names short and meaningful.
+ST-NMG-020: Default Studio Display Name — Activity is still using the Studio default DisplayName (missing or equals the activity type name). Flag every non-structural activity with a default name. Structural containers (Sequence, Flowchart, FlowDecision, FlowStep, Body, TryCatch, Try, Catch, Finally, StateMachine) are exempt. Examples: a `Click` activity with DisplayName="Click", an `Assign` with no DisplayName at all, a `LogMessage` named "LogMessage".
 
 [CATEGORY: Design Best Practices | Severity: HIGH for structural, MEDIUM for style]
 ST-DBP-002: High Arguments Count — Too many arguments in workflow. Refactor into smaller reusable workflows.
@@ -144,8 +145,11 @@ IMPORTANT GUIDELINES — CONSISTENCY & ACCURACY:
 - Every file MUST be checked against every rule. Do NOT short-circuit: even if a file has a HIGH-severity finding, continue checking for MEDIUM/LOW/INFO findings. The list above is non-negotiable — all rules apply to all files (except GEN-004, which is project-level and reported once).
 - For EVERY variable in EVERY file: apply ST-NMG-001, ST-NMG-005, ST-NMG-006, ST-NMG-008, ST-NMG-009, ST-NMG-010 independently. A single variable can (and commonly does) violate multiple rules simultaneously — for example `Filtercandidatedetailsfromsaptabledata` violates ST-NMG-001 (no `str_` prefix), ST-NMG-008 (length > 30), AND ST-NMG-010 (no PascalCase boundaries, all one lowercase run). Report all three findings. Do not collapse multiple distinct rule violations into a single finding.
 - For EVERY argument in EVERY file: apply ST-NMG-002, ST-NMG-010, ST-NMG-011, ST-NMG-012, ST-NMG-016 independently. Same rule — one argument can trigger several findings.
-- For EVERY activity: apply ST-NMG-004 (if its DisplayName is shared with another activity in the same file, excluding only these structural defaults: `Sequence`, `Flowchart`, `FlowDecision`, `FlowStep`). Activities without an explicit DisplayName use their type name — duplicate defaults like multiple un-renamed `Assign` activities or `If` activities MUST be flagged.
-- If a file has 10 variables and 3 of them violate ST-NMG-001, report 3 findings, not 1. If one variable triggers 4 different naming rules, report 4 findings.
+- For EVERY activity: apply BOTH of these rules independently per activity:
+  * **ST-NMG-004** — if the DisplayName is shared with another activity in the same file (excluding only structural defaults `Sequence`, `Flowchart`, `FlowDecision`, `FlowStep`). Activities without an explicit DisplayName use their type name — duplicate defaults like multiple un-renamed `Assign` activities or `If` activities MUST be flagged.
+  * **ST-NMG-020** — if the DisplayName is the Studio default (missing OR equal to the activity type name) AND the type is NOT structural. Structural exemptions: `Sequence`, `NSequence`, `Flowchart`, `FlowDecision`, `FlowStep`, `FlowSwitch`, `Body`, `TryCatch`, `Try`, `Catch`, `Finally`, `Activity`, `StateMachine`. Every default-named activity gets one ST-NMG-020 finding, regardless of whether it's also a duplicate (ST-NMG-004 and ST-NMG-020 can both apply to the same activity — emit both findings).
+- For ST-NMG-020 findings specifically, set `activity_path` to `"Activity: {type_name}"` (matches the static reviewer convention so backend autofix dispatches correctly).
+- If a file has 10 variables and 3 of them violate ST-NMG-001, report 3 findings, not 1. If one variable triggers 4 different naming rules, report 4 findings. If a file has 5 default-named `Assign` activities, report 5 ST-NMG-020 findings (one per activity), not one summary.
 
 === CASCADING RULE APPLICATION ===
 - The backend auto-fixer runs multiple passes and re-reviews after each pass. Your job is to detect ALL violations in the ORIGINAL input — subsequent passes will be computed deterministically by the backend static reviewer. You do not need to "predict" what a fix will produce; just report what's wrong now.
@@ -159,7 +163,7 @@ IMPORTANT GUIDELINES — CONSISTENCY & ACCURACY:
 
 === AUTO_FIXABLE FLAGS ===
 - Set auto_fixable=true for these rules (the backend has deterministic fixers for them):
-  * Naming: ST-NMG-001, ST-NMG-002, ST-NMG-004, ST-NMG-005, ST-NMG-006, ST-NMG-008, ST-NMG-009, ST-NMG-010, ST-NMG-011, ST-NMG-012, ST-NMG-016
+  * Naming: ST-NMG-001, ST-NMG-002, ST-NMG-004, ST-NMG-005, ST-NMG-006, ST-NMG-008, ST-NMG-009, ST-NMG-010, ST-NMG-011, ST-NMG-012, ST-NMG-016, ST-NMG-020
   * Design Best Practices: ST-DBP-003 (auto-fix inserts a Log Message into empty catches), ST-DBP-023 (auto-fix deletes empty workflow files on accept)
   * Reliability: GEN-REL-001 (self-closing empty sequences, and open-tag empty sequences with metadata only)
   * General: GEN-001, GEN-003

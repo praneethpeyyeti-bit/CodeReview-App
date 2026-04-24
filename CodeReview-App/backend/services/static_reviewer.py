@@ -365,6 +365,52 @@ def _check_st_nmg_016(ctx: ReviewContext) -> list[Finding]:
     return findings
 
 
+# Activity types whose default DisplayName (equal to the type name) is
+# acceptable — these are structural containers where a more descriptive
+# name is usually unnecessary and often misleading.
+_STRUCTURAL_ACTIVITY_TYPES: frozenset = frozenset({
+    "Sequence", "NSequence",
+    "Flowchart", "FlowDecision", "FlowStep", "FlowSwitch",
+    "Body", "TryCatch", "Try", "Catch", "Finally",
+    "Activity", "StateMachine",
+})
+
+
+def _check_st_nmg_020(ctx: ReviewContext) -> list[Finding]:
+    """ST-NMG-020: Default Studio Display Name.
+
+    Flags any activity whose DisplayName was left at the Studio default
+    (either missing or equal to the activity type). Structural containers
+    (Sequence, Flowchart, TryCatch, ...) are excluded because leaving those
+    defaults is common and usually intentional.
+
+    Auto-fix renames such activities using a meaningful descriptor —
+    selector content for UI Automation activities (Click/TypeInto/GetText/
+    etc.) or the most telling property for others (Assign's target variable,
+    LogMessage's Message, InvokeWorkflowFile's filename, ...).
+    """
+    findings: list[Finding] = []
+    for a in ctx.activities:
+        if a.type_name in _STRUCTURAL_ACTIVITY_TYPES:
+            continue
+        # Default-named = DisplayName missing (falls back to type_name in parser)
+        # or explicitly set to the type_name.
+        if a.display_name != a.type_name:
+            continue
+        findings.append(_make_finding(
+            ctx, "ST-NMG-020", "Default Studio Display Name", "LOW", "Naming",
+            f"Activity of type '{a.type_name}' is still using the default Studio "
+            f"display name. Rename it to describe what the activity does.",
+            "Auto-fix derives a meaningful label from the activity's selector "
+            "(UI Automation) or from its most telling property (Assign target, "
+            "LogMessage text, etc.). Activities with no derivable descriptor "
+            "are left for manual renaming.",
+            activity_path=f"Activity: {a.type_name}",
+            auto_fixable=True,
+        ))
+    return findings
+
+
 # ═══════════════════════════════════════════════════════════════════
 # DESIGN BEST PRACTICES
 # ═══════════════════════════════════════════════════════════════════
@@ -842,6 +888,7 @@ _RULES: list = [
     _check_st_nmg_011,
     _check_st_nmg_012,
     _check_st_nmg_016,
+    _check_st_nmg_020,
     _check_st_dbp_002,
     _check_st_dbp_003,
     _check_st_dbp_007,

@@ -19,6 +19,10 @@ _META_ELEMENTS = {
     "DelegateInArgument", "DelegateOutArgument",
     "ActivityAction", "InArgument", "OutArgument", "InOutArgument",
     "WorkflowViewState", "ViewState",
+    # x:* XAML primitives that show up in VisualBasic.Settings,
+    # ViewState dictionaries, etc. Without explicit exclusion they
+    # leak into ctx.activities as type_name="Null"/"Reference"/etc.
+    "Null", "Reference", "Type", "Static", "StaticResource",
 }
 
 # UI container activity types

@@ -21,7 +21,7 @@ const SEVERITY_ORDER: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']
 
 // All 41 Workflow Analyzer rules
 export const ALL_RULES: { rule_id: string; rule_name: string; category: FindingCategory }[] = [
-  // Naming (11)
+  // Naming (12)
   { rule_id: 'ST-NMG-001', rule_name: 'Variables Naming Convention', category: 'Naming' },
   { rule_id: 'ST-NMG-002', rule_name: 'Arguments Naming Convention', category: 'Naming' },
   { rule_id: 'ST-NMG-004', rule_name: 'Display Name Duplication', category: 'Naming' },
@@ -33,6 +33,7 @@ export const ALL_RULES: { rule_id: string; rule_name: string; category: FindingC
   { rule_id: 'ST-NMG-011', rule_name: 'DataTable Argument Naming', category: 'Naming' },
   { rule_id: 'ST-NMG-012', rule_name: 'Argument Default Values', category: 'Naming' },
   { rule_id: 'ST-NMG-016', rule_name: 'Argument Length Exceeded', category: 'Naming' },
+  { rule_id: 'ST-NMG-020', rule_name: 'Default Studio Display Name', category: 'Naming' },
   // Design Best Practices (10)
   { rule_id: 'ST-DBP-002', rule_name: 'High Arguments Count', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-003', rule_name: 'Empty Catch Block', category: 'Design Best Practices' },

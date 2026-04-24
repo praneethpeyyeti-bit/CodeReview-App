@@ -146,13 +146,18 @@ def _rule_priority(rule_id: str) -> int:
     # Length shortening runs after case has been normalized.
     if rule_id in ("ST-NMG-008", "ST-NMG-016"):
         return 4
-    if rule_id.startswith("ST-NMG"):
+    # Default-name rewrite runs LAST among the NMG rules so its descriptors
+    # (which often reference variable/argument names) reflect the final
+    # post-rename, post-shorten state of the XAML.
+    if rule_id == "ST-NMG-020":
         return 5
+    if rule_id.startswith("ST-NMG"):
+        return 6
     if rule_id.startswith("UI-"):
-        return 6  # UI Automation / Performance / Reliability
+        return 7  # UI Automation / Performance / Reliability
     if rule_id.startswith("GEN"):
-        return 7  # General
-    return 8
+        return 8  # General
+    return 9
 
 
 # ── Individual fix handlers ────────────────────────────────────────
@@ -1374,6 +1379,149 @@ def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
     return {"modified": True, "content": new_content, "changes": changes}
 
 
+_NMG020_STRUCTURAL: frozenset = frozenset({
+    "Sequence", "NSequence",
+    "Flowchart", "FlowDecision", "FlowStep", "FlowSwitch",
+    "Body", "TryCatch", "Try", "Catch", "Finally",
+    "Activity", "StateMachine",
+})
+
+_NMG020_SKIP_TAGS: frozenset = frozenset({
+    "Members", "Property", "Variable",
+    "ActivityAction", "DelegateInArgument", "DelegateOutArgument",
+    "InArgument", "OutArgument", "InOutArgument",
+    "TextExpression", "Literal", "AssemblyReference",
+    "String", "Boolean", "Int32", "Int64", "Double", "Decimal",
+    "Collection", "Dictionary",
+    "WorkflowViewState", "ViewState",
+})
+
+
+def _fix_st_nmg_020(content: str, findings: list[Finding]) -> dict:
+    """ST-NMG-020: Rename activities still using the default Studio name.
+
+    For each non-structural activity whose DisplayName is missing or equals
+    its type name, derive a meaningful descriptor (selector for UI
+    activities, type-specific property for others) and either INSERT or
+    REPLACE the DisplayName attribute. Activities with no derivable
+    descriptor are skipped (left for manual renaming).
+    """
+    if not findings:
+        return {"modified": False, "content": content, "changes": []}
+
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Walk doc order and collect activities to rename plus their descriptors
+    to_rename: list[tuple[str, str, bool, str]] = []  # (type, effective_dn, explicit, descriptor)
+    for elem in root.iter():
+        tn = _local_tag(elem.tag)
+        if tn in _NMG020_STRUCTURAL or tn in _NMG020_SKIP_TAGS or "." in tn:
+            continue
+        if tn.startswith("x:") or tn.startswith("sap"):
+            continue
+        explicit_dn = elem.attrib.get("DisplayName")
+        is_default = explicit_dn is None or explicit_dn == tn
+        if not is_default:
+            continue
+        descriptor = _extract_activity_descriptor(elem)
+        if not descriptor:
+            continue  # can't derive — leave for manual rename
+        to_rename.append((tn, explicit_dn if explicit_dn is not None else tn, explicit_dn is not None, descriptor))
+
+    if not to_rename:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Group by type so we can iterate raw-text tag occurrences for each type.
+    # For each type, enumerate opening tags of that type in the raw text, then
+    # zip with ET occurrences to apply targeted changes.
+    from collections import defaultdict
+    by_type: dict[str, list[int]] = defaultdict(list)
+    for idx, (tn, _, _, _) in enumerate(to_rename):
+        by_type[tn].append(idx)
+
+    used_names: set[str] = set()
+    for tn in set(tn for tn, *_ in to_rename):
+        # Collect all existing DisplayNames in the doc for uniqueness checks
+        for m in re.finditer(r'\bDisplayName="([^"]+)"', content):
+            used_names.add(m.group(1))
+
+    replacements: list[tuple[int, int, str, str]] = []  # start, end, replacement, msg
+
+    for type_name, indices in sorted(by_type.items()):
+        # Raw-text opening tags of this type, excluding property elements
+        tag_re = re.compile(
+            r"<(?P<ns>\w+:)?" + re.escape(type_name) + r"(?=[\s/>])(?P<attrs>[^>]*?)(?P<close>/?>)",
+            re.DOTALL,
+        )
+        raw_matches = list(tag_re.finditer(content))
+
+        # Separate matches with vs without DisplayName
+        typed_matches: list[tuple[re.Match, bool]] = []  # (match, has_dn)
+        for m in raw_matches:
+            attrs = m.group("attrs") or ""
+            typed_matches.append((m, "DisplayName=" in attrs))
+
+        if len(typed_matches) < len(indices):
+            continue  # safety — raw-text count can't explain all ET occurrences
+
+        # For each ET-flagged default-named activity of this type, find the
+        # corresponding raw-text occurrence by walking both in doc order.
+        ranked = 0
+        for m, has_dn in typed_matches:
+            if ranked >= len(indices):
+                break
+            # All ET-flagged activities are default-named. The raw-text match
+            # is the same occurrence iff its DisplayName attr is missing OR
+            # equals the type name.
+            attrs = m.group("attrs") or ""
+            dn_m = re.search(r'\bDisplayName="([^"]+)"', attrs)
+            current_dn = dn_m.group(1) if dn_m else None
+            is_default_raw = current_dn is None or current_dn == type_name
+            if not is_default_raw:
+                continue  # already-custom-named; skip, not one of our ET flags
+
+            idx = indices[ranked]
+            _, _, _, descriptor = to_rename[idx]
+            new_name = _build_unique_displayname(type_name, descriptor, used_names, ranked + 1)
+            used_names.add(new_name)
+            escaped_new = _xml_escape(new_name, {'"': '&quot;'})
+
+            ns = m.group("ns") or ""
+            close = m.group("close")
+            if has_dn:
+                # Replace existing DisplayName="type_name" with DisplayName="new_name"
+                new_attrs = re.sub(
+                    r'\bDisplayName="[^"]+"',
+                    f'DisplayName="{escaped_new}"',
+                    attrs,
+                    count=1,
+                )
+                new_tag = f"<{ns}{type_name}{new_attrs}{close}"
+                msg = f"ST-NMG-020: Renamed default {type_name} -> '{new_name}'"
+            else:
+                # Insert DisplayName as the first attribute after the tag name
+                sep = " " if attrs and not attrs.startswith(" ") else ""
+                new_tag = f'<{ns}{type_name} DisplayName="{escaped_new}"{sep}{attrs}{close}'
+                msg = f"ST-NMG-020: Named default {type_name} as '{new_name}'"
+            replacements.append((m.start(), m.end(), new_tag, msg))
+            ranked += 1
+
+    if not replacements:
+        return {"modified": False, "content": content, "changes": []}
+
+    # Apply in reverse position so earlier offsets stay valid
+    replacements.sort(key=lambda r: r[0], reverse=True)
+    new_content = content
+    for start, end, rep, _ in replacements:
+        new_content = new_content[:start] + rep + new_content[end:]
+
+    changes = [msg for _, _, _, msg in sorted(replacements, key=lambda r: r[0])]
+    return {"modified": True, "content": new_content, "changes": changes}
+
+
 def _fix_st_dbp_003(content: str, findings: list[Finding]) -> dict:
     """ST-DBP-003: Insert a LogMessage inside empty Catch blocks.
 
@@ -1630,6 +1778,7 @@ _FIX_HANDLERS: dict[str, Callable] = {
     "ST-NMG-011": _fix_st_nmg_011,
     "ST-NMG-012": _fix_st_nmg_012,
     "ST-NMG-016": _fix_st_nmg_016,
+    "ST-NMG-020": _fix_st_nmg_020,
     # Design Best Practices
     "ST-DBP-002": _noop_fix,
     "ST-DBP-003": _fix_st_dbp_003,
