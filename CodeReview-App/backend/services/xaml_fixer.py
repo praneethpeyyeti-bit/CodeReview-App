@@ -40,6 +40,13 @@ def fix_xaml(xml_content: str, findings: list[Finding]) -> dict:
     """
     Apply fixes to XAML content based on findings.
 
+    The pipeline runs in priority order (removals before renames, etc.) and
+    repeats until no rule produces further changes or the iteration cap is
+    reached. After each pass, the current XAML is re-reviewed so rules
+    that should cascade — e.g. a prefix rename creating a new length
+    violation, or an empty-Sequence removal revealing an unused variable —
+    get a fresh set of findings to act on.
+
     Returns:
         {
             "original_content": str,
@@ -51,28 +58,61 @@ def fix_xaml(xml_content: str, findings: list[Finding]) -> dict:
     changes: list[str] = []
     content = xml_content
     delete = False
+    current_findings = list(findings)
 
-    # Group findings by rule_id for batch processing
-    findings_by_rule: dict[str, list[Finding]] = {}
-    for f in findings:
-        findings_by_rule.setdefault(f.rule_id, []).append(f)
+    max_passes = 5  # cascading rules usually settle in 2–3 passes
+    last_content = None
+    for pass_num in range(1, max_passes + 1):
+        # Group findings by rule_id for batch processing. Sort keys so the
+        # execution order within a priority tier is stable across runs.
+        findings_by_rule: dict[str, list[Finding]] = {}
+        for f in current_findings:
+            if f.auto_fixable:
+                findings_by_rule.setdefault(f.rule_id, []).append(f)
+        ordered_rule_ids = sorted(
+            findings_by_rule.keys(),
+            key=lambda rid: (_rule_priority(rid), rid),
+        )
 
-    # Apply fixes in order of priority (CRITICAL first)
-    for rule_id, rule_findings in sorted(
-        findings_by_rule.items(),
-        key=lambda x: _rule_priority(x[0]),
-    ):
-        handler = _FIX_HANDLERS.get(rule_id)
-        if handler:
-            result = handler(content, rule_findings)
+        pass_modified = False
+        for rule_id in ordered_rule_ids:
+            handler = _FIX_HANDLERS.get(rule_id)
+            if not handler:
+                continue
+            result = handler(content, findings_by_rule[rule_id])
             if result.get("delete"):
                 delete = True
                 changes.extend(result.get("changes", []))
-                # Deletion overrides further per-file edits; stop processing this file.
-                break
+                return {
+                    "original_content": xml_content,
+                    "modified_content": content,
+                    "changes_applied": changes,
+                    "delete": delete,
+                }
             if result["modified"]:
                 content = result["content"]
                 changes.extend(result["changes"])
+                pass_modified = True
+
+        if not pass_modified or content == last_content:
+            break  # converged
+
+        last_content = content
+
+        # Re-review the current content so any new violations introduced by
+        # this pass (length grew after prefix add, PascalCase split revealed
+        # camelCase problem, etc.) get picked up in the next iteration.
+        try:
+            from services.xaml_parser import parse_xaml_file
+            from services.static_reviewer import review_single_file
+            file_name = findings[0].file_name if findings else "unknown.xaml"
+            zip_entry = findings[0].zip_entry_path if findings else ""
+            ctx = parse_xaml_file(file_name, zip_entry, content)
+            current_findings = review_single_file(ctx, [file_name])
+        except Exception:
+            # If re-review fails, fall back to the original findings for the
+            # next pass — partial progress is still better than nothing.
+            current_findings = list(findings)
 
     return {
         "original_content": xml_content,
@@ -94,13 +134,25 @@ def _rule_priority(rule_id: str) -> int:
         return 1
     if rule_id.startswith("ST-DBP"):
         return 1  # Design Best Practices
+    # Prefix adders run first among the renames so every downstream rule
+    # sees the canonical prefixed form.
+    if rule_id in ("ST-NMG-001", "ST-NMG-002", "ST-NMG-009", "ST-NMG-011"):
+        return 2
+    # Case correction needs to happen BEFORE length shortening so the
+    # shortening step can drop whole words from a properly PascalCased name
+    # instead of naively truncating a concatenated lowercase run.
+    if rule_id == "ST-NMG-010":
+        return 3
+    # Length shortening runs after case has been normalized.
+    if rule_id in ("ST-NMG-008", "ST-NMG-016"):
+        return 4
     if rule_id.startswith("ST-NMG"):
-        return 2  # Naming (renames)
+        return 5
     if rule_id.startswith("UI-"):
-        return 3  # UI Automation / Performance / Reliability
+        return 6  # UI Automation / Performance / Reliability
     if rule_id.startswith("GEN"):
-        return 4  # General
-    return 5
+        return 7  # General
+    return 8
 
 
 # ── Individual fix handlers ────────────────────────────────────────
@@ -726,20 +778,32 @@ def _fix_st_nmg_010(content: str, findings: list[Finding]) -> dict:
 # ── ST-NMG-008: Shorten overlong variable names ────────────────────
 
 def _fix_st_nmg_008(content: str, findings: list[Finding]) -> dict:
-    """ST-NMG-008: Shorten variable names that exceed the length limit."""
-    modified = False
-    changes = []
-    new_content = content
-    seen = set()
+    """ST-NMG-008: Shorten variable names > length limit.
 
-    for f in findings:
-        name = _extract_name_from_finding(f, "variable")
-        if not name or name in seen:
+    Re-scans the *current* XAML for variable declarations so the rule
+    composes with earlier fixers — e.g. when ST-NMG-001 adds a `str_` prefix
+    and the result is still too long, or when ST-NMG-010 expands a
+    concatenated lowercase run into a long PascalCase name.
+    """
+    if not findings:
+        return {"modified": False, "content": content, "changes": []}
+
+    modified = False
+    changes: list[str] = []
+    new_content = content
+    seen: set[str] = set()
+
+    # Discover current variable declarations from the XAML
+    current_names: set[str] = set()
+    for m in re.finditer(r'<Variable\b[^>]*\bName="([^"]+)"', new_content):
+        current_names.add(m.group(1))
+
+    for name in sorted(current_names):
+        if name in seen or len(name) <= 30:
             continue
         seen.add(name)
-
         short = _shorten_name(name, limit=28)
-        if not short:
+        if not short or short == name:
             continue
         new_content, count = _rename_in_xaml(new_content, name, short)
         if count > 0:
@@ -805,20 +869,29 @@ def _fix_st_nmg_012(content: str, findings: list[Finding]) -> dict:
 # ── ST-NMG-016: Shorten overlong argument names ────────────────────
 
 def _fix_st_nmg_016(content: str, findings: list[Finding]) -> dict:
-    """ST-NMG-016: Shorten argument names that exceed the length limit."""
-    modified = False
-    changes = []
-    new_content = content
-    seen = set()
+    """ST-NMG-016: Shorten argument names > length limit.
 
-    for f in findings:
-        name = _extract_name_from_finding(f, "argument")
-        if not name or name in seen:
+    Re-scans the *current* XAML for `<x:Property>` declarations so the rule
+    composes correctly after ST-NMG-002/010/011 apply their renames.
+    """
+    if not findings:
+        return {"modified": False, "content": content, "changes": []}
+
+    modified = False
+    changes: list[str] = []
+    new_content = content
+    seen: set[str] = set()
+
+    current_names: set[str] = set()
+    for m in re.finditer(r'<x:Property\b[^>]*\bName="([^"]+)"', new_content):
+        current_names.add(m.group(1))
+
+    for name in sorted(current_names):
+        if name in seen or len(name) <= 30:
             continue
         seen.add(name)
-
         short = _shorten_name(name, limit=28)
-        if not short:
+        if not short or short == name:
             continue
         new_content, count = _rename_in_xaml(new_content, name, short)
         if count > 0:
@@ -946,7 +1019,10 @@ def _fix_gen_rel_001(content: str, findings: list[Finding]) -> dict:
 
 _SELECTOR_PRIORITY = ("aaname", "innertext", "title", "name")
 _GENERIC_DISPLAY_NAMES = {
-    "Sequence", "Assign", "If", "Flowchart", "FlowDecision", "FlowStep",
+    # Structural / scaffolding types where duplicate default names are
+    # usually noise (matches the reviewer's filter). Assign and If are
+    # intentionally NOT here — duplicate Assigns/Ifs are real violations.
+    "Sequence", "Flowchart", "FlowDecision", "FlowStep",
     "Body", "TryCatch", "Try", "Catch", "Finally",
 }
 
@@ -1042,6 +1118,112 @@ def _find_activity_selector(elem: ET.Element) -> str:
     return ""
 
 
+def _strip_vb_brackets(s: str) -> str:
+    """Strip surrounding VB expression brackets and common quote noise."""
+    s = s.strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+    # Trim outer quoted strings like: "some literal"
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1].strip()
+    return s
+
+
+def _extract_activity_descriptor(elem: ET.Element) -> str | None:
+    """Derive a meaningful label for an activity.
+
+    Priority ladder:
+      1. UI selector (Click, TypeInto, etc.): pick aaname/innertext/title/name
+         from the target selector — most descriptive when present.
+      2. Activity-type fallback: use the property that best identifies what
+         the activity does (e.g. Assign target variable, LogMessage text,
+         InvokeWorkflowFile filename, Delay duration, If/While condition).
+      3. None: caller will fall back to a numeric suffix.
+    """
+    # 1. Selector path (UI Automation activities)
+    selector = _find_activity_selector(elem)
+    if selector:
+        desc = _extract_selector_descriptor(selector)
+        if desc:
+            return desc
+
+    local = _local_tag(elem.tag)
+
+    # 2a. Assign → target variable from <Assign.To><OutArgument>[X]</OutArgument>...
+    if local == "Assign":
+        for child in elem:
+            if _local_tag(child.tag) != "Assign.To":
+                continue
+            for gc in child:
+                text = (gc.text or "").strip()
+                if not text:
+                    continue
+                cleaned = _strip_vb_brackets(text)
+                if cleaned:
+                    return f"to {cleaned}"
+        return None
+
+    # 2b. LogMessage / Log → Level + Message hint
+    if local in ("LogMessage", "Log"):
+        for attr_name, attr_val in elem.attrib.items():
+            if attr_name.split("}")[-1] == "Message" and attr_val:
+                cleaned = _strip_vb_brackets(html.unescape(attr_val))
+                # Take the first ~30 chars of meaningful content
+                if cleaned:
+                    return cleaned[:40].strip()
+        level = elem.attrib.get("Level", "")
+        if level:
+            return f"Level={level}"
+        return None
+
+    # 2c. WriteLine → Text
+    if local == "WriteLine":
+        text = elem.attrib.get("Text", "")
+        if text:
+            return _strip_vb_brackets(html.unescape(text))[:40]
+        return None
+
+    # 2d. InvokeWorkflowFile → workflow filename (basename, no extension)
+    if local == "InvokeWorkflowFile":
+        path = elem.attrib.get("WorkflowFileName", "")
+        if path:
+            base = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            if base.lower().endswith(".xaml"):
+                base = base[:-5]
+            return base
+        return None
+
+    # 2e. Delay → Duration
+    if local in ("Delay", "NDelay"):
+        dur = elem.attrib.get("Duration", "")
+        if dur:
+            return _strip_vb_brackets(dur)[:30]
+        return None
+
+    # 2f. If / While / DoWhile → Condition
+    if local in ("If", "While", "DoWhile"):
+        cond = elem.attrib.get("Condition", "")
+        if cond:
+            return _strip_vb_brackets(html.unescape(cond))[:40]
+        return None
+
+    # 2g. ForEach → collection being iterated
+    if local in ("ForEach", "ForEachRow"):
+        values = elem.attrib.get("Values", "") or elem.attrib.get("DataTable", "")
+        if values:
+            return _strip_vb_brackets(html.unescape(values))[:40]
+        return None
+
+    # 2h. Switch → Expression
+    if local == "Switch":
+        expr = elem.attrib.get("Expression", "")
+        if expr:
+            return _strip_vb_brackets(html.unescape(expr))[:40]
+        return None
+
+    return None
+
+
 def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
     """ST-NMG-004: Rename duplicate DisplayNames.
 
@@ -1059,21 +1241,38 @@ def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
     except ET.ParseError:
         return {"modified": False, "content": content, "changes": []}
 
-    # Walk document order, collect (display_name, type_name, selector)
-    activities: list[tuple[str, str, str]] = []
+    # Walk document order, collect (effective_dn, type_name, explicit_dn, descriptor)
+    # An implicit DisplayName (no attribute set, e.g. Assign activities in
+    # Studio default) resolves to the type name — matching what the reviewer
+    # sees in ctx.activities. The fixer handles both cases:
+    #   - explicit dn: positional replace of the existing attribute
+    #   - implicit dn: INSERT a DisplayName attribute into the opening tag
+    skip_tags = {
+        "Activity", "Members", "Property", "Variable",
+        "ActivityAction", "DelegateInArgument", "DelegateOutArgument",
+        "InArgument", "OutArgument", "InOutArgument",
+        "TextExpression", "Literal", "AssemblyReference",
+        "String", "Boolean", "Int32", "Int64", "Double", "Decimal",
+        "Collection", "Dictionary",
+        "WorkflowViewState", "ViewState",
+    }
+    activities: list[tuple[str, str, bool, str | None]] = []
     for elem in root.iter():
-        dn = elem.attrib.get("DisplayName")
-        if dn is None:
-            continue
         type_name = _local_tag(elem.tag)
-        if dn in _GENERIC_DISPLAY_NAMES:
+        if type_name in skip_tags or "." in type_name:
             continue
-        selector = _find_activity_selector(elem)
-        activities.append((dn, type_name, selector))
+        if type_name.startswith("x:") or type_name.startswith("sap"):
+            continue
+        explicit = elem.attrib.get("DisplayName")
+        effective_dn = explicit if explicit is not None else type_name
+        if effective_dn in _GENERIC_DISPLAY_NAMES:
+            continue
+        descriptor = _extract_activity_descriptor(elem)
+        activities.append((effective_dn, type_name, explicit is not None, descriptor))
 
     # Group activity indices by display name
     groups: dict[str, list[int]] = defaultdict(list)
-    for i, (dn, _, _) in enumerate(activities):
+    for i, (dn, _, _, _) in enumerate(activities):
         groups[dn].append(i)
 
     # Only act on names that appear >1 time (matching the reviewer's definition)
@@ -1102,29 +1301,64 @@ def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
     replacements: list[tuple[int, int, str, str]] = []  # start, end, new_str, msg
 
     for name, idxs in duplicates.items():
-        # Match the Nth DisplayName="{name}" in raw text. Use the attribute's
-        # XML-escaped form to align with the file.
-        escaped_attr = _xml_escape(name, {'"': '&quot;'})
-        pattern = re.compile(r'\bDisplayName="' + re.escape(escaped_attr) + r'"')
-        matches = list(pattern.finditer(content))
-        if len(matches) < len(idxs):
-            # Raw text has fewer matches than ET found — skip to stay safe.
-            continue
+        # Determine whether this group is explicit (DisplayName set on every
+        # occurrence) or implicit (none have it — the reviewer inferred the
+        # name from the type). Mixed cases: handle each occurrence per-item.
+        type_name = activities[idxs[0]][1]
+        group_explicit_flags = [activities[i][2] for i in idxs]
 
-        # Keep occurrence #1 (idxs[0]); rename occurrences #2..N.
-        for rank, idx in enumerate(idxs[1:], start=2):
-            _, type_name, selector = activities[idx]
-            descriptor = _extract_selector_descriptor(selector)
-            new_name = _build_unique_displayname(type_name, descriptor, used_names, rank)
-            used_names.add(new_name)
-            escaped_new = _xml_escape(new_name, {'"': '&quot;'})
-            m = matches[rank - 1]
-            replacements.append((
-                m.start(),
-                m.end(),
-                f'DisplayName="{escaped_new}"',
-                f"ST-NMG-004: Renamed duplicate DisplayName '{name}' -> '{new_name}' (occurrence #{rank})",
-            ))
+        if all(group_explicit_flags):
+            # All explicit: positional replace of existing DisplayName attribute
+            escaped_attr = _xml_escape(name, {'"': '&quot;'})
+            pattern = re.compile(r'\bDisplayName="' + re.escape(escaped_attr) + r'"')
+            matches = list(pattern.finditer(content))
+            if len(matches) < len(idxs):
+                continue
+            for rank, idx in enumerate(idxs[1:], start=2):
+                _, _, _, descriptor = activities[idx]
+                new_name = _build_unique_displayname(type_name, descriptor, used_names, rank)
+                used_names.add(new_name)
+                escaped_new = _xml_escape(new_name, {'"': '&quot;'})
+                m = matches[rank - 1]
+                replacements.append((
+                    m.start(),
+                    m.end(),
+                    f'DisplayName="{escaped_new}"',
+                    f"ST-NMG-004: Renamed duplicate DisplayName '{name}' -> '{new_name}' (occurrence #{rank})",
+                ))
+
+        elif not any(group_explicit_flags):
+            # All implicit: insert DisplayName attribute into opening tag #2..N
+            # of this type. Match only opening tags that lack DisplayName.
+            # Require the char after the type name to be whitespace/`/`/`>`.
+            # This excludes property elements like <Assign.To> or
+            # <Assign.Value> which would otherwise be matched by \b.
+            tag_re = re.compile(
+                r"<(?P<ns>\w+:)?" + re.escape(type_name) + r"(?=[\s/>])(?P<attrs>[^>]*?)(?P<close>/?>)",
+                re.DOTALL,
+            )
+            raw = [m for m in tag_re.finditer(content) if "DisplayName=" not in m.group("attrs")]
+            if len(raw) < len(idxs):
+                continue
+            for rank, idx in enumerate(idxs[1:], start=2):
+                _, _, _, descriptor = activities[idx]
+                new_name = _build_unique_displayname(type_name, descriptor, used_names, rank)
+                used_names.add(new_name)
+                escaped_new = _xml_escape(new_name, {'"': '&quot;'})
+                m = raw[rank - 1]
+                ns = m.group("ns") or ""
+                attrs = m.group("attrs") or ""
+                close = m.group("close")
+                # Insert DisplayName as the first attribute after the tag name
+                sep = " " if attrs and not attrs.startswith(" ") else ""
+                new_tag = f'<{ns}{type_name} DisplayName="{escaped_new}"{sep}{attrs}{close}'
+                replacements.append((
+                    m.start(),
+                    m.end(),
+                    new_tag,
+                    f"ST-NMG-004: Added DisplayName '{new_name}' to duplicate {type_name} (occurrence #{rank})",
+                ))
+        # mixed: skip for now — rare in practice; can iterate per-item later.
 
     if not replacements:
         return {"modified": False, "content": content, "changes": []}
@@ -1154,7 +1388,6 @@ def _fix_st_dbp_003(content: str, findings: list[Finding]) -> dict:
     inside the Body Sequence — right before its closing tag. ET is only used
     for discovery; string substitution preserves xmlns declarations.
     """
-    import uuid
     if not findings:
         return {"modified": False, "content": content, "changes": []}
 
@@ -1250,7 +1483,9 @@ def _fix_st_dbp_003(content: str, findings: list[Finding]) -> dict:
         if not body_is_empty(inner):
             continue
 
-        uid = uuid.uuid4().hex[:6]
+        # Deterministic id — tied to the catch position, so re-running the
+        # fix on the same input produces byte-identical output.
+        uid = f"{modified_count + 1:03d}"
         indent = "          "
         log_msg = (
             f"{indent}<ui:LogMessage "

@@ -139,18 +139,34 @@ AUTO-FIX SAFETY CONSTRAINT:
 - If a fix would alter the workflow's behavior in any way, mark it as auto_fixable=false and provide a recommendation for manual review instead.
 
 IMPORTANT GUIDELINES — CONSISTENCY & ACCURACY:
-- DETERMINISTIC: Given the same input, you MUST produce the same findings. Do NOT vary results between runs. Apply each rule mechanically — if the condition is met, report it; if not, skip it. Never invent or speculate.
-- EVIDENCE-BASED ONLY: Every finding MUST cite specific evidence from the provided context data (activity name, variable name, line reference, or property value). If you cannot point to concrete evidence, do NOT report the finding.
+
+=== FULL COVERAGE — NO SKIPPING ===
+- Every file MUST be checked against every rule. Do NOT short-circuit: even if a file has a HIGH-severity finding, continue checking for MEDIUM/LOW/INFO findings. The list above is non-negotiable — all rules apply to all files (except GEN-004, which is project-level and reported once).
+- For EVERY variable in EVERY file: apply ST-NMG-001, ST-NMG-005, ST-NMG-006, ST-NMG-008, ST-NMG-009, ST-NMG-010 independently. A single variable can (and commonly does) violate multiple rules simultaneously — for example `Filtercandidatedetailsfromsaptabledata` violates ST-NMG-001 (no `str_` prefix), ST-NMG-008 (length > 30), AND ST-NMG-010 (no PascalCase boundaries, all one lowercase run). Report all three findings. Do not collapse multiple distinct rule violations into a single finding.
+- For EVERY argument in EVERY file: apply ST-NMG-002, ST-NMG-010, ST-NMG-011, ST-NMG-012, ST-NMG-016 independently. Same rule — one argument can trigger several findings.
+- For EVERY activity: apply ST-NMG-004 (if its DisplayName is shared with another activity in the same file, excluding only these structural defaults: `Sequence`, `Flowchart`, `FlowDecision`, `FlowStep`). Activities without an explicit DisplayName use their type name — duplicate defaults like multiple un-renamed `Assign` activities or `If` activities MUST be flagged.
+- If a file has 10 variables and 3 of them violate ST-NMG-001, report 3 findings, not 1. If one variable triggers 4 different naming rules, report 4 findings.
+
+=== CASCADING RULE APPLICATION ===
+- The backend auto-fixer runs multiple passes and re-reviews after each pass. Your job is to detect ALL violations in the ORIGINAL input — subsequent passes will be computed deterministically by the backend static reviewer. You do not need to "predict" what a fix will produce; just report what's wrong now.
+
+=== DETERMINISM & ACCURACY ===
+- DETERMINISTIC: Given the same input, you MUST produce the same findings in the same order. Apply each rule mechanically — if the condition is met, report it; if not, skip it. Never invent or speculate.
+- EVIDENCE-BASED ONLY: Every finding MUST cite specific evidence from the provided context data (activity name, variable name, argument name, or property value). If you cannot point to concrete evidence, do NOT report the finding.
 - NO HALLUCINATION: Do NOT fabricate activity names, variable names, property values, or issues that are not present in the input data. Do NOT assume the existence of code elements not listed in the context.
-- NO PADDING: Do NOT generate findings just to produce output. If a workflow has no issues, return an empty findings array. Quality over quantity.
+- NO PADDING: Do NOT generate findings just to hit a quota. If a workflow has no issues, return an empty findings array. But also do NOT under-report — coverage must be exhaustive.
+- FINDING ORDERING: Within a file, order findings by (rule_id ascending, then by the affected entity name ascending). Across files, order by file_name ascending. This gives deterministic, predictable output.
+
+=== AUTO_FIXABLE FLAGS ===
 - Set auto_fixable=true for these rules (the backend has deterministic fixers for them):
   * Naming: ST-NMG-001, ST-NMG-002, ST-NMG-004, ST-NMG-005, ST-NMG-006, ST-NMG-008, ST-NMG-009, ST-NMG-010, ST-NMG-011, ST-NMG-012, ST-NMG-016
   * Design Best Practices: ST-DBP-003 (auto-fix inserts a Log Message into empty catches), ST-DBP-023 (auto-fix deletes empty workflow files on accept)
-  * Reliability: GEN-REL-001 (self-closing empty sequences)
+  * Reliability: GEN-REL-001 (self-closing empty sequences, and open-tag empty sequences with metadata only)
   * General: GEN-001, GEN-003
   For all other rules (including GEN-002), set auto_fixable=false (detection-only).
+
+=== FORMATTING ===
 - Use the exact category names: "Naming", "Design Best Practices", "UI Automation", "Performance", "Reliability", "Security", "General".
-- Prioritize CRITICAL and HIGH findings — these represent real risks. Do not pad with trivial INFO findings.
 - Cross-reference across files when checking for unused variables/arguments (GEN-001, GEN-002), project structure (GEN-004), and argument mismatches.
 """.strip()
 

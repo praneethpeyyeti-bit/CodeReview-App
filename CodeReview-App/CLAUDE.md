@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-Full-stack code review tool for UiPath RPA XAML workflows. Features both **static analysis** (instant, no AI) and **AI-powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer). Analyzes workflows against 37 unique Workflow Analyzer rules across 7 categories and provides auto-fix for 16 rules (including file-level deletion of empty workflows).
+Full-stack code review tool for UiPath RPA XAML workflows. **Static analysis is the default** — deterministic, instant, zero auth, zero agent units. **AI-Powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer) is opt-in per request. Both modes cover the same 37 unique Workflow Analyzer rules across 7 categories; auto-fix handles 16 rules (including file-level deletion of empty workflows).
 
 ## Architecture
 
 - **Backend**: Python FastAPI (port 8000) — `backend/`
 - **Frontend**: React + TypeScript + Vite (port 5173) — `frontend/`
-- **Static Analysis**: Deterministic rule checking on parsed XAML — no model needed
-- **LLM Integration**: Optional, via UiPath LangChain SDK (`uipath_langchain`)
+- **Static Analysis** (default): Deterministic rule checking on parsed XAML — no model, no auth, <1s
+- **LLM Integration** (opt-in): Via UiPath LangChain SDK (`uipath_langchain`); uses `temperature=0 + seed=42` plus submission-order batch collection and post-processing sort for byte-stable output
 
 ## Running the App
 
@@ -87,17 +87,19 @@ frontend/src/
 
 ## Two Review Modes
 
-### Static Analysis (No AI)
-- Toggle "Static Analysis" in the upload zone (default)
-- Returns results instantly (< 1 second)
-- No UiPath auth, no Agent Units consumed
+### Static Analysis (default)
+- The **default** for both the UI (toggle opens on Static) and the API (POST `/api/review` with no `model_id` runs static)
+- Returns results instantly (< 1 second) — sync response, no job polling
+- Zero UiPath auth, zero Agent Units
 - 36 rule checker functions run deterministically on parsed XAML data
+- Backed by `DEFAULT_MODE = "static"` in [main.py](backend/main.py); `/api/models` exposes `"default": "static"` + `"default_ai_model": "<claude-id>"`
 
-### AI-Powered Review
-- Toggle "AI-Powered" and select a model (Claude, GPT-4, Gemini)
-- Requires `uipath auth` and active token
+### AI-Powered Review (opt-in)
+- Flip the UI toggle to "AI-Powered (opt-in)" and pick a model (Claude, GPT-4o, Gemini)
+- API callers pass `model_id=<model-id>` explicitly
+- Requires per-user `uipath auth` and active token (see README "AI-Powered Review Setup")
 - Takes 30-60 seconds with polling
-- Uses LLM to analyze against prompt-defined rules
+- Uses LLM to analyze against prompt-defined rules. `temperature=0`, `seed=42`, submission-order batch collection, and a final sort-by-(file, rule, entity) make output byte-stable across runs unless the model fingerprint changes upstream
 
 ## Rule Catalog (37 Unique Rules, 7 Categories)
 
@@ -142,14 +144,32 @@ The remaining 21 rules (ST-DBP-002/007/020/024/025/026/027/028, UI-DBP-006/013, 
 
 ### Fix pipeline ordering
 
-`_rule_priority()` in [xaml_fixer.py](backend/services/xaml_fixer.py) controls execution order. **Removal rules must run before rename rules** so stale references don't survive:
+`_rule_priority()` in [xaml_fixer.py](backend/services/xaml_fixer.py) controls execution order. The tiers are:
 
 1. **Priority 0** — Security (UI-SEC-*, UX-DBP-029)
 2. **Priority 1** — Removals + design fixes: ST-NMG-005 (shadow), ST-NMG-006 (var-arg collision), ST-NMG-012 (argument defaults), GEN-001 (unused variable), ST-DBP-* (empty catch, empty workflow, etc.)
-3. **Priority 2** — Renames: ST-NMG-001/002/004/008/009/010/011/016
-4. **Priority 3-4** — UI Automation, Performance, Reliability, General rules
+3. **Priority 2** — Prefix renames: ST-NMG-001/002/009/011 — add `str_`/`in_`/`out_`/`io_`/`dt_` before downstream rules see them
+4. **Priority 3** — Case correction: ST-NMG-010 — splits concatenated lowercase runs via wordninja and PascalCases
+5. **Priority 4** — Length shortening: ST-NMG-008/016 — runs last on properly-cased names so it can drop whole middle words instead of naively truncating
+6. **Priority 5** — Remaining NMG rules (e.g. ST-NMG-004)
+7. **Priority 6-7** — UI Automation / Performance / Reliability / General
 
-Example of ordering mattering: if ST-NMG-002 ran before ST-NMG-012, renaming `Name="test"` to `Name="in_test"` would happen first, but the attribute-form default `this:Main.test="value"` would still reference the old name. ST-NMG-012 removes the default attribute first so the subsequent rename applies cleanly.
+Example: if ST-NMG-002 ran before ST-NMG-012, renaming `Name="test"` to `Name="in_test"` would happen first, but the attribute-form default `this:Main.test="value"` would still reference the old name. ST-NMG-012 removes the default attribute first so the subsequent rename applies cleanly.
+
+### Convergence loop — rules cascade until stable
+
+`fix_xaml()` runs up to **5 passes** in a convergence loop. Between passes it re-parses the current XAML and re-invokes the static reviewer (`review_single_file`) to produce a fresh set of findings. This means a chain like `Filtercandidate… (38 chars)` → `str_Filtercandidate… (42 chars, too long)` → `str_FilterCandidateDetailsFromSapTableData (42 chars, PascalCase)` → `str_FilterCandidateTableData (28 chars)` all completes in one `/api/fix` call, because the length violation introduced on pass 1 is detected by the re-review and fixed on pass 2.
+
+Every handler either consults its findings list OR re-scans the current XAML (ST-NMG-008/010/016 use re-scan so they compose correctly regardless of what earlier passes changed). The static reviewer is authoritative for subsequent passes; AI mode does not re-invoke the LLM between passes to avoid burning agent units.
+
+### Determinism
+
+Both modes aim for byte-identical output on the same input across runs:
+
+- **Static**: no `uuid`, `random`, or wall-clock reads in fixers; `ST-DBP-003` generates LogMessage IDs as `LogMessage_AutoFix_001/002/…` (counter-based). `Counter.items()` iterations are explicitly `sorted()` so finding order is stable. Variable-scope tracking uses owner IdRef with a deterministic owner-counter fallback.
+- **AI**: LLM called with `temperature=0`, `seed=42`, `response_format=json_object`. Parallel batches collected in **submission order** (not `as_completed`) so batch interleaving is stable. Post-processing sorts all findings by `(file_name, rule_id, activity_path)` before assigning `CR-###` IDs.
+
+Verified: 3 consecutive identical static reviews produce the same finding hash; 3 consecutive fixes produce byte-identical XAML output.
 
 ### Rule scoping notes
 - **GEN-REL-001 Empty Sequences** only flags standalone user-authored Sequences. Sequences that are direct children of `<ActivityAction>` (catch handler bodies) are marked `is_structural_wrapper` by the parser and skipped — they're covered by ST-DBP-003. Sequences inside `TryCatch.Try` and `TryCatch.Finally` *are* flagged (no other rule covers them).

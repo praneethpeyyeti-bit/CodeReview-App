@@ -4,13 +4,13 @@ An AI-powered and static analysis code review tool for UiPath RPA workflows. Upl
 
 ## Features
 
-- **Static Analysis (No AI)** — Instant results from 36 rule checkers, no auth or Agent Units needed
-- **AI-Powered Review** — Deep analysis using Claude, GPT-4, Gemini via UiPath AI Trust Layer
-- **37 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, and general quality
-- **Auto-Fix 16 Rules** — Variable/argument prefix renaming, PascalCase body conversion, duplicate DisplayName rewrites (selector-derived), shadow removal, length trimming, argument-default cleanup, empty-catch Log Message injection, empty-sequence removal, unused-variable removal, empty-workflow file deletion
+- **Static Analysis (default)** — Instant, deterministic results from 36 rule checkers. No UiPath auth, no Agent Units, byte-stable output across runs.
+- **AI-Powered Review (opt-in)** — Deep analysis via Claude / GPT-4o / Gemini through UiPath AI Trust Layer. `temperature=0` + `seed=42` + submission-order batch collection + deterministic post-sort → same input ⇒ same output.
+- **37 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, general quality
+- **Auto-Fix 16 Rules with Convergence Loop** — The fix pipeline runs up to 5 passes with a static re-review between passes, so cascades like `prefix add → length overflow → PascalCase → word-split shorten` converge automatically in a single `/api/fix` call
 - **Side-by-Side Diff** — Preview all changes before accepting
 - **Folder Structure Preserved** — Fixed files maintain original ZIP directory layout
-- **Excel Export** — Styled report with executive summary, findings, per-file breakdown, and rule coverage
+- **Excel Export** — Styled report with executive summary, findings, per-file breakdown, rule coverage
 - **Two-Page UI** — Clean upload page with animated workflow pipeline, full results dashboard
 
 ## Prerequisites
@@ -111,11 +111,15 @@ on purpose, so every new clone has to authenticate once.
 
 ## Review Modes
 
-| Mode | Speed | Auth Required | Rules | Agent Units |
-|------|-------|:---:|:---:|:---:|
-| Static Analysis | < 1 second | No | 36 checkers | None |
-| Claude 3.7 Sonnet | 30-60 seconds | Yes | 37 (via prompt) | Yes |
-| GPT-4o / Gemini | 30-60 seconds | Yes | 37 (via prompt) | Yes |
+**Static Analysis is the default** — it's deterministic, instant, free, and works offline with no UiPath auth. AI mode is opt-in per review when you need the extra anti-pattern heuristics.
+
+| Mode | Default | Speed | Auth Required | Rules | Agent Units |
+|------|:---:|-------|:---:|:---:|:---:|
+| Static Analysis | ✅ | < 1 second | No | 36 checkers | None |
+| Claude 3.7 Sonnet | — | 30-60 seconds | Yes | 37 (via prompt) | Yes |
+| GPT-4o / Gemini | — | 30-60 seconds | Yes | 37 (via prompt) | Yes |
+
+Direct API callers that omit `model_id` get static analysis. The UI toggle also opens on Static.
 
 ## Auto-Fix Rules (16)
 

@@ -197,24 +197,33 @@ def review_with_llm(
         logger.info("Batch %d/%d complete — %d findings", batch_idx, len(batches), len(batch_findings))
         return batch_findings
 
-    # Run batches in parallel (up to 3 concurrent)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Run batches in parallel (up to 3 concurrent). Use submission-order
+    # collection (not as_completed) so findings are always ordered by batch
+    # index — otherwise the same input can produce different orderings and
+    # IDs across runs depending on network latency.
+    from concurrent.futures import ThreadPoolExecutor
 
-    all_findings: list[Finding] = []
     max_workers = min(3, len(batches))
 
     if len(batches) == 1:
-        all_findings = _review_batch(1, batches[0])
+        all_findings: list[Finding] = _review_batch(1, batches[0])
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_review_batch, idx, batch): idx
+            # submit in order, collect .result() in the same order
+            futures_in_order = [
+                executor.submit(_review_batch, idx, batch)
                 for idx, batch in enumerate(batches, 1)
-            }
-            for future in as_completed(futures):
-                all_findings.extend(future.result())
+            ]
+            all_findings = []
+            for fut in futures_in_order:
+                all_findings.extend(fut.result())
 
-    # Assign sequential IDs across all batches
+    # Post-process: sort findings deterministically so output is stable
+    # regardless of which batch finished first or how the LLM interleaved
+    # findings. Order: file_name, rule_id, activity_path.
+    all_findings.sort(key=lambda f: (f.file_name or "", f.rule_id or "", f.activity_path or ""))
+
+    # Assign sequential IDs in deterministic order
     for i, finding in enumerate(all_findings, start=1):
         finding.id = f"CR-{i:03d}"
 

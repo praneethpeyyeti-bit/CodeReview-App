@@ -130,13 +130,20 @@ def _check_st_nmg_002(ctx: ReviewContext) -> list[Finding]:
 
 
 def _check_st_nmg_004(ctx: ReviewContext) -> list[Finding]:
-    """ST-NMG-004: Display Name Duplication."""
+    """ST-NMG-004: Display Name Duplication.
+
+    Includes Assign — multiple Assign activities with default DisplayName
+    "Assign" is a real violation per UiPath naming guidelines. The remaining
+    generic filter skips structural-by-design types (Sequence, flowchart
+    nodes) where duplicates are common scaffolding noise rather than user
+    mistakes.
+    """
     findings = []
-    # Exclude generic names that are commonly duplicated
-    generic_names = {"Sequence", "Assign", "If", "Flowchart", "FlowDecision", "FlowStep"}
+    generic_names = {"Sequence", "Flowchart", "FlowDecision", "FlowStep"}
     names = [a.display_name for a in ctx.activities if a.display_name not in generic_names]
     counts = Counter(names)
-    for name, count in counts.items():
+    # Iterate keys in a stable order so finding IDs are deterministic across runs
+    for name, count in sorted(counts.items()):
         if count > 1:
             findings.append(_make_finding(
                 ctx, "ST-NMG-004", "Display Name Duplication", "MEDIUM", "Naming",
@@ -677,7 +684,7 @@ def _check_ui_prr_003(ctx: ReviewContext) -> list[Finding]:
     open_types = {"OpenBrowser", "OpenApplication", "StartProcess"}
     open_activities = [a for a in ctx.activities if a.type_name in open_types]
     type_counts = Counter(a.type_name for a in open_activities)
-    for type_name, count in type_counts.items():
+    for type_name, count in sorted(type_counts.items()):
         if count > 1:
             findings.append(_make_finding(
                 ctx, "UI-PRR-003", "Open Application Misuse", "MEDIUM", "Performance",
@@ -861,6 +868,25 @@ _RULES: list = [
     _check_gen_003,
     _check_gen_005,
 ]
+
+
+def review_single_file(
+    ctx: ReviewContext,
+    all_file_names: list[str] | None = None,
+) -> list[Finding]:
+    """Run all rules against a single parsed XAML context.
+
+    Used by the auto-fix convergence loop to re-evaluate a file after each
+    pass — if a fix introduced a new violation (e.g. a rename pushed the
+    name over the length limit) the next pass will see the new finding.
+    """
+    findings: list[Finding] = []
+    for rule_fn in _RULES:
+        findings.extend(rule_fn(ctx))
+    findings.extend(_check_gen_004(ctx, all_file_names or [ctx.file_name]))
+    for i, f in enumerate(findings, start=1):
+        f.id = f"CR-{i:03d}"
+    return findings
 
 
 def review_static(

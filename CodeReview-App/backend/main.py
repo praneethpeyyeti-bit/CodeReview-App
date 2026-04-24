@@ -22,8 +22,12 @@ from services.xaml_parser import parse_xaml_file
 from services.llm_reviewer import (
     review_with_llm,
     ALL_MODELS,
-    DEFAULT_MODEL,
+    DEFAULT_MODEL as DEFAULT_AI_MODEL,
 )
+
+# The default review mode for the API is static analysis — deterministic,
+# instant, no UiPath auth, no agent units. AI mode is opt-in per request.
+DEFAULT_MODE = "static"
 from services.token_refresh import token_refresh_loop, refresh_once, _seconds_until_expiry, _read_auth_json
 from services.xaml_fixer import fix_xaml
 from services.static_reviewer import review_static
@@ -184,7 +188,8 @@ async def manual_refresh():
 @app.get("/api/models")
 async def get_models():
     return {
-        "default": DEFAULT_MODEL,
+        "default": DEFAULT_MODE,             # "static" — what the app uses when no mode is specified
+        "default_ai_model": DEFAULT_AI_MODEL, # pre-selected model when a caller opts into AI
         "models": MODEL_CATALOG,
     }
 
@@ -232,7 +237,7 @@ async def _run_review_job(
 @app.post("/api/review")
 async def review(
     project_name: str = Form(...),
-    model_id: str = Form(DEFAULT_MODEL),
+    model_id: str = Form(DEFAULT_MODE),
     files: list[UploadFile] = File(...),
 ):
     # Reload .env to pick up refreshed tokens
