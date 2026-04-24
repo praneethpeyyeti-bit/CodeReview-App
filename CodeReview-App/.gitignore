@@ -1,0 +1,49 @@
+# Environment
+backend/.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# UiPath auth & output
+backend/.uipath/
+backend/output/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# Local test/debug artifacts
+*.bak
+backend/output/
+im_*.json
+auto_findings*.json
+rv*.json
+fx*.json
+f[0-9]*.json
+r.json
+f.json
+auto.json
+accept.json
+verify.json
+crt*.json
+_aud/
+_crt/
+_deltest/
+_emptyout/
+_nmg12test/
+_oldtest/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
