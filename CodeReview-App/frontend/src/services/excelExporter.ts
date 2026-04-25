@@ -39,7 +39,6 @@ export const ALL_RULES: { rule_id: string; rule_name: string; category: FindingC
   { rule_id: 'ST-DBP-003', rule_name: 'Empty Catch Block', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-007', rule_name: 'Multiple Flowchart Layers', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-020', rule_name: 'Undefined Output Properties', category: 'Design Best Practices' },
-  { rule_id: 'ST-DBP-023', rule_name: 'Empty Workflow', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-024', rule_name: 'Persistence Activity Check', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-025', rule_name: 'Variables Serialization', category: 'Design Best Practices' },
   { rule_id: 'ST-DBP-026', rule_name: 'Delay Activity Usage', category: 'Design Best Practices' },

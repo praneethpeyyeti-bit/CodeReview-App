@@ -89,18 +89,25 @@ def _make_finding(
 # ═══════════════════════════════════════════════════════════════════
 
 def _check_st_nmg_001(ctx: ReviewContext) -> list[Finding]:
-    """ST-NMG-001: Variables Naming Convention — check type prefixes."""
+    """ST-NMG-001: Variables Naming Convention — check type prefixes.
+
+    Only flags variables whose type maps to a known prefix (String, Int32,
+    Boolean, DataTable, DateTime, TimeSpan, arrays/lists, dictionaries).
+    Unknown types (e.g. `ui:WorkbookApplication`, custom entity types, SAP
+    objects) are left alone — applying a wrong prefix there produced renames
+    like `str_OpenWorkbook` on an Excel handle, which broke VB resolution
+    and cascaded into BC30451 "variable not declared" errors.
+    """
     findings = []
     for var in ctx.variables:
         expected = _TYPE_PREFIXES.get(var.type)
         if not expected:
-            # Check for array/list types
             if "[]" in var.type or "List" in var.type:
                 expected = "arr_"
             elif "Dictionary" in var.type:
                 expected = "dic_"
             else:
-                expected = "str_"  # default for unknown types
+                continue  # unknown type — don't guess
         if not var.name.startswith(expected):
             findings.append(_make_finding(
                 ctx, "ST-NMG-001", "Variables Naming Convention", "MEDIUM", "Naming",
@@ -139,7 +146,15 @@ def _check_st_nmg_004(ctx: ReviewContext) -> list[Finding]:
     mistakes.
     """
     findings = []
-    generic_names = {"Sequence", "Flowchart", "FlowDecision", "FlowStep"}
+    # Aligned with the fixer's `_GENERIC_DISPLAY_NAMES` set — these are
+    # structural scaffolding types where the fixer deliberately leaves
+    # default names alone, so flagging them produces noise the user can't act
+    # on (the fixer would just skip). Try/Catch/Finally are particularly
+    # noisy because TryCatch blocks always emit them as duplicates.
+    generic_names = {
+        "Sequence", "Flowchart", "FlowDecision", "FlowStep",
+        "Body", "TryCatch", "Try", "Catch", "Finally",
+    }
     names = [a.display_name for a in ctx.activities if a.display_name not in generic_names]
     counts = Counter(names)
     # Iterate keys in a stable order so finding IDs are deterministic across runs
@@ -157,20 +172,49 @@ def _check_st_nmg_004(ctx: ReviewContext) -> list[Finding]:
 
 
 def _check_st_nmg_005(ctx: ReviewContext) -> list[Finding]:
-    """ST-NMG-005: Variable Overrides Variable — shadowing in inner scopes."""
+    """ST-NMG-005: Variable Overrides Variable — only flag TRUE nested shadows.
+
+    Two variables with the same name shadow each other only when one scope is
+    an *ancestor* of the other (i.e. one scope_path is a strict prefix of the
+    other). Sibling sub-sequences (e.g. ``<Sequence x:Key="get">`` and
+    ``<Sequence x:Key="create">``) each have their own independent scope and
+    legitimately declare the same name without shadowing.
+    """
     findings = []
-    seen: dict[str, str] = {}
+    # Group variables by name so we can compare every pair within the group.
+    by_name: dict[str, list] = {}
     for var in ctx.variables:
-        if var.name in seen and seen[var.name] != var.scope:
-            findings.append(_make_finding(
-                ctx, "ST-NMG-005", "Variable Overrides Variable", "MEDIUM", "Naming",
-                f"Variable '{var.name}' is declared in multiple scopes: '{seen[var.name]}' and '{var.scope}'. "
-                "This causes variable shadowing.",
-                "Rename one of the variables, or remove the inner-scope shadow (auto-fix keeps the outermost).",
-                activity_path=f"Variable: {var.name}",
-                auto_fixable=True,
-            ))
-        seen.setdefault(var.name, var.scope)
+        by_name.setdefault(var.name, []).append(var)
+
+    reported: set[tuple[str, str]] = set()
+    for name, group in sorted(by_name.items()):
+        if len(group) < 2:
+            continue
+        # Find ancestor/descendant pairs. A is ancestor of B iff
+        # A.scope_path is a strict prefix of B.scope_path.
+        for outer in group:
+            for inner in group:
+                if outer is inner:
+                    continue
+                op = outer.scope_path or [outer.scope]
+                ip = inner.scope_path or [inner.scope]
+                if len(op) >= len(ip):
+                    continue
+                if ip[: len(op)] != op:
+                    continue
+                key = (name, inner.scope)
+                if key in reported:
+                    continue
+                reported.add(key)
+                findings.append(_make_finding(
+                    ctx, "ST-NMG-005", "Variable Overrides Variable", "MEDIUM", "Naming",
+                    f"Variable '{name}' declared in inner scope '{inner.scope}' "
+                    f"shadows the outer declaration in '{outer.scope}'.",
+                    "Rename the inner variable, or remove it so references resolve to the outer one "
+                    "(auto-fix removes only this specific inner-scope declaration).",
+                    activity_path=f"Variable: {name} @ {inner.scope}",
+                    auto_fixable=True,
+                ))
     return findings
 
 
@@ -293,10 +337,13 @@ def _body_is_pascal_case(body: str) -> bool:
     Rules:
       - Must not contain underscores
       - Must start with an uppercase letter
-      - If the body is long (>= 10 chars) it must show word boundaries
-        (internal uppercase letters or digits). Long all-lowercase bodies like
-        'Filtercandidatedetailsfromsaptabledata' are treated as concatenated
-        words that still need word-splitting into PascalCase.
+      - If the body is long (>= 10 chars) AND looks like a concatenation of
+        multiple lowercase words with no boundary markers (e.g.
+        'Filtercandidatedetailsfromsaptabledata'), treat it as needing
+        word-splitting and reject. A long single English word like
+        'Description' is valid PascalCase and must NOT be flagged — we
+        consult wordninja to disambiguate (single-word bodies are accepted
+        regardless of length).
     """
     if not body:
         return True
@@ -304,12 +351,27 @@ def _body_is_pascal_case(body: str) -> bool:
         return False
     if not body[0].isalpha() or not body[0].isupper():
         return False
-    # Long bodies must show at least one internal word boundary.
+    # Long bodies with internal uppercase/digit boundaries are clearly
+    # multi-word PascalCase — accept fast.
     if len(body) >= 10:
         tail = body[1:]
         has_boundary = any(c.isupper() or c.isdigit() for c in tail)
         if not has_boundary:
-            return False
+            # No internal boundary. Could be either a single long English
+            # word ("Description", "Authentication", "Configuration") or
+            # a concatenated soup ("Filtercandidatedetailsfromsaptabledata").
+            # Use wordninja to decide — a single-word split means the whole
+            # body IS that word, which is valid PascalCase.
+            try:
+                import wordninja as _wn
+                parts = _wn.split(body.lower())
+                if len(parts) <= 1:
+                    return True
+                # Multi-word soup — needs splitting + recapitalisation.
+                return False
+            except ImportError:
+                # Fall back to the strict rule if wordninja isn't available.
+                return False
     return True
 
 
@@ -373,6 +435,14 @@ _STRUCTURAL_ACTIVITY_TYPES: frozenset = frozenset({
     "Flowchart", "FlowDecision", "FlowStep", "FlowSwitch",
     "Body", "TryCatch", "Try", "Catch", "Finally",
     "Activity", "StateMachine",
+    # Statement-like activities whose type name IS the meaningful name —
+    # asking the user to rename "Break" or "Rethrow" to a synthetic label
+    # adds noise without information. ActivityFunc is a generic delegate
+    # wrapper with no derivable descriptor.
+    "Break", "Continue", "Rethrow", "Throw",
+    "ActivityFunc", "ActivityAction",
+    "Pick", "PickBranch",
+    "TerminateWorkflow",
 })
 
 
@@ -476,22 +546,6 @@ def _check_st_dbp_020(ctx: ReviewContext) -> list[Finding]:
                 activity_path=f"Argument: {arg.name}",
             ))
     return findings
-
-
-def _check_st_dbp_023(ctx: ReviewContext) -> list[Finding]:
-    """ST-DBP-023: Empty Workflow."""
-    # Filter out root/meta elements
-    real_activities = [a for a in ctx.activities if a.depth > 0 and a.type_name not in (
-        "Sequence", "Flowchart", "StateMachine", "Activity",
-    )]
-    if not real_activities:
-        return [_make_finding(
-            ctx, "ST-DBP-023", "Empty Workflow", "MEDIUM", "Design Best Practices",
-            "Workflow contains no meaningful activities.",
-            "Add activities or remove the empty workflow file (auto-fix deletes the file on accept).",
-            auto_fixable=True,
-        )]
-    return []
 
 
 def _check_st_dbp_024(ctx: ReviewContext) -> list[Finding]:
@@ -893,7 +947,6 @@ _RULES: list = [
     _check_st_dbp_003,
     _check_st_dbp_007,
     _check_st_dbp_020,
-    _check_st_dbp_023,
     _check_st_dbp_024,
     _check_st_dbp_025,
     _check_st_dbp_026,

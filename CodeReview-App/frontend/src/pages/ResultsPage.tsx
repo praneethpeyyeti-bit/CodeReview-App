@@ -40,6 +40,7 @@ export default function ResultsPage() {
   const [showDiffView, setShowDiffView] = useState(false);
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [projectJson, setProjectJson] = useState<string | null>(null);
+  const [fixId, setFixId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [fixSummary, setFixSummary] = useState<{
     totalChanges: number;
@@ -63,6 +64,7 @@ export default function ResultsPage() {
       const res = await submitFix(fixFd);
       setFixResults(res.files);
       setProjectJson(res.project_json ?? null);
+      setFixId(res.fix_id ?? null);
       setShowDiffView(true);
 
       let totalChanges = 0;
@@ -255,6 +257,7 @@ export default function ResultsPage() {
           projectName={reviewResponse.project_name}
           files={fixResults}
           projectJson={projectJson}
+          fixId={fixId}
           onClose={() => setShowDiffView(false)}
           onAccepted={handleFixAccepted}
         />

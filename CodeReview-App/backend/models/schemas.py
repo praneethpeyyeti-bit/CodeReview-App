@@ -30,6 +30,11 @@ class VariableSummary(BaseModel):
     name: str
     type: str
     scope: str
+    # Ancestor chain of scope IDs from document root down to this variable's
+    # owner. A variable B shadows A only when A.scope_path is a strict prefix
+    # of B.scope_path (A is an ancestor of B). Sibling sub-sequences that
+    # happen to declare the same variable name are NOT shadows.
+    scope_path: list[str] = []
 
 
 class ArgumentSummary(BaseModel):

@@ -40,7 +40,6 @@ ST-DBP-002: High Arguments Count — Too many arguments in workflow. Refactor in
 ST-DBP-003: Empty Catch Block — Catch block without handling logic. Add logging or proper exception handling. (Severity: HIGH)
 ST-DBP-007: Multiple Flowchart Layers — Overly complex nested flowcharts. Simplify or split into sequences.
 ST-DBP-020: Undefined Output Properties — Output arguments not assigned. Ensure all outputs are properly set. (Severity: HIGH)
-ST-DBP-023: Empty Workflow — Workflow has no activities. Remove or implement logic.
 ST-DBP-024: Persistence Activity Check — Incorrect persistence usage. Use persistence only when required. (Severity: HIGH)
 ST-DBP-025: Variables Serialization — Non-serializable variables. Ensure variables are serializable.
 ST-DBP-026: Delay Activity Usage — Hardcoded delays used. Replace with dynamic waits or triggers. (Severity: MEDIUM)
@@ -164,7 +163,7 @@ IMPORTANT GUIDELINES — CONSISTENCY & ACCURACY:
 === AUTO_FIXABLE FLAGS ===
 - Set auto_fixable=true for these rules (the backend has deterministic fixers for them):
   * Naming: ST-NMG-001, ST-NMG-002, ST-NMG-004, ST-NMG-005, ST-NMG-006, ST-NMG-008, ST-NMG-009, ST-NMG-010, ST-NMG-011, ST-NMG-012, ST-NMG-016, ST-NMG-020
-  * Design Best Practices: ST-DBP-003 (auto-fix inserts a Log Message into empty catches), ST-DBP-023 (auto-fix deletes empty workflow files on accept)
+  * Design Best Practices: ST-DBP-003 (auto-fix inserts a Log Message into empty catches)
   * Reliability: GEN-REL-001 (self-closing empty sequences, and open-tag empty sequences with metadata only)
   * General: GEN-001, GEN-003
   For all other rules (including GEN-002), set auto_fixable=false (detection-only).

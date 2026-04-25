@@ -5,6 +5,7 @@ interface Props {
   projectName: string;
   files: FixFileResult[];
   projectJson?: string | null;
+  fixId?: string | null;
   onClose: () => void;
   onAccepted: (savedPath: string) => void;
 }
@@ -111,7 +112,7 @@ function computeSideBySideDiff(original: string, modified: string): SideBySideLi
   return result;
 }
 
-export default function DiffViewer({ projectName, files, projectJson, onClose, onAccepted }: Props) {
+export default function DiffViewer({ projectName, files, projectJson, fixId, onClose, onAccepted }: Props) {
   const [activeFileIndex, setActiveFileIndex] = useState(0);
   const [accepting, setAccepting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -162,7 +163,7 @@ export default function DiffViewer({ projectName, files, projectJson, onClose, o
           delete: willDelete,
         };
       });
-      const res = await acceptFix(projectName, filesToSave, outputDir || undefined, projectJson);
+      const res = await acceptFix(projectName, filesToSave, outputDir || undefined, projectJson, fixId);
       onAccepted(res.saved_path);
     } catch (err: any) {
       setError(err.message ?? 'Failed to save fixes');

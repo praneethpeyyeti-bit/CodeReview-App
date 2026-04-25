@@ -12,6 +12,13 @@ load_dotenv(override=True)  # Must be called before importing uipath_langchain
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import UploadFile as StarletteUploadFile
+
+# Starlette ≥ 0.40 enforces a 1 MiB per-part cap on multipart uploads by
+# default. UiPath project ZIPs routinely exceed that, so the upload endpoints
+# parse the form manually with a cap that matches the 50 MiB ZIP size limit
+# in zip_extractor with a little headroom for the envelope.
+MAX_UPLOAD_PART_SIZE = 60 * 1024 * 1024
 
 # Add backend directory to path so models/services can be imported
 sys.path.insert(0, os.path.dirname(__file__))
@@ -199,6 +206,11 @@ async def get_models():
 # ──────────────────────────────────────────────────────────────
 _review_jobs: dict[str, dict] = {}
 
+# Cache of non-XAML project files keyed by fix_id so /api/fix/accept can
+# reconstruct the full folder structure without re-uploading the ZIP.
+# Entry shape: {"other_files": [{"zip_entry_path": str, "content_bytes": bytes}]}
+_fix_passthrough: dict[str, dict] = {}
+
 
 async def _run_review_job(
     job_id: str,
@@ -235,11 +247,24 @@ async def _run_review_job(
 
 
 @app.post("/api/review")
-async def review(
-    project_name: str = Form(...),
-    model_id: str = Form(DEFAULT_MODE),
-    files: list[UploadFile] = File(...),
-):
+async def review(request: Request):
+    # Parse the multipart form with an explicit part-size cap; FastAPI's
+    # auto-parsing via `Form(...)` / `File(...)` would hit Starlette's 1 MiB
+    # default and reject any ZIP larger than that.
+    try:
+        form = await request.form(max_part_size=MAX_UPLOAD_PART_SIZE)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Upload parse error: {e}")
+
+    project_name = str(form.get("project_name") or "").strip()
+    model_id = str(form.get("model_id") or DEFAULT_MODE)
+    uploaded = [v for v in form.getlist("files") if isinstance(v, StarletteUploadFile)]
+    if not project_name:
+        raise HTTPException(status_code=400, detail="project_name is required")
+    if not uploaded:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+    files = uploaded
+
     # Reload .env to pick up refreshed tokens
     load_dotenv(override=True)
 
@@ -380,17 +405,28 @@ async def get_review_status(job_id: str):
 
 
 @app.post("/api/fix")
-async def apply_fixes(
-    project_name: str = Form(...),
-    findings_json: str = Form(...),
-    files: list[UploadFile] = File(...),
-):
+async def apply_fixes(request: Request):
     """
     Apply auto-fixes to uploaded XAML files based on review findings.
     Saves originals to output/{project_name}/original/.
     Returns per-file original vs modified content with change lists.
     """
     import json as json_mod
+
+    try:
+        form = await request.form(max_part_size=MAX_UPLOAD_PART_SIZE)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Upload parse error: {e}")
+
+    project_name = str(form.get("project_name") or "").strip()
+    findings_json = str(form.get("findings_json") or "")
+    files = [v for v in form.getlist("files") if isinstance(v, StarletteUploadFile)]
+    if not project_name:
+        raise HTTPException(status_code=400, detail="project_name is required")
+    if not findings_json:
+        raise HTTPException(status_code=400, detail="findings_json is required")
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
 
     # Parse findings
     try:
@@ -403,6 +439,7 @@ async def apply_fixes(
     is_zip = len(files) == 1 and (files[0].filename or "").lower().endswith(".zip")
     xaml_contents: list[dict] = []
     project_json: str | None = None
+    other_files: list[dict] = []
 
     if is_zip:
         zip_bytes = await files[0].read()
@@ -412,6 +449,7 @@ async def apply_fixes(
             raise HTTPException(status_code=400, detail=str(e))
         xaml_contents = result["files"]
         project_json = result.get("project_json")
+        other_files = result.get("other_files", [])
     else:
         for f in files:
             fname = f.filename or "unknown.xaml"
@@ -469,12 +507,21 @@ async def apply_fixes(
         for fr in fix_results if fr.get("delete")
     ]
 
+    # Stash the passthrough files so /api/fix/accept can reconstruct the
+    # full project folder (assets, .cs, Test_Data, .entities/, etc.) without
+    # re-uploading the ZIP.
+    fix_id: str | None = None
+    if other_files:
+        fix_id = str(uuid.uuid4())
+        _fix_passthrough[fix_id] = {"other_files": other_files}
+
     return {
         "project_name": project_name,
         "files": fix_results,
         "project_json": project_json,
         "fixed_rule_ids": sorted(fixed_rule_ids),
         "deleted_files": deleted_files,
+        "fix_id": fix_id,
     }
 
 
@@ -489,6 +536,7 @@ async def accept_fixes(request: Request):
     file_list = body.get("files", [])
     project_json = body.get("project_json")
     output_dir = body.get("output_dir", "")
+    fix_id = body.get("fix_id")
 
     if not project_name:
         raise HTTPException(status_code=400, detail="project_name is required")
@@ -498,6 +546,31 @@ async def accept_fixes(request: Request):
     else:
         base_dir = os.path.join(os.path.dirname(__file__), "output", project_name)
     os.makedirs(base_dir, exist_ok=True)
+
+    # Step 1: write every non-XAML archive entry (assets, .cs, Test_Data,
+    # Screenshots, .entities/, project.json, etc.) so the full folder
+    # structure is reconstructed. The XAML / project.json writes below then
+    # overlay the authoritative modified content on top.
+    passthrough = _fix_passthrough.pop(fix_id, None) if fix_id else None
+    passthrough_count = 0
+    xaml_paths = {
+        (item.get("zip_entry_path") or item.get("file_name") or "")
+        for item in file_list
+    }
+    if passthrough:
+        for entry in passthrough.get("other_files", []):
+            rel = entry.get("zip_entry_path") or ""
+            if not rel:
+                continue
+            # Skip entries that we're about to write (or delete) as XAMLs so
+            # we don't resurrect a deleted file or overwrite with stale bytes.
+            if rel in xaml_paths:
+                continue
+            out_path = os.path.join(base_dir, rel)
+            os.makedirs(os.path.dirname(out_path) or base_dir, exist_ok=True)
+            with open(out_path, "wb") as fp:
+                fp.write(entry.get("content_bytes", b""))
+            passthrough_count += 1
 
     saved = 0
     deleted = 0
@@ -529,7 +602,13 @@ async def accept_fixes(request: Request):
 
         # Create subdirectories as needed
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as fp:
+        # newline="" disables Python's universal-newlines write translation.
+        # Without it, on Windows text mode turns every "\n" into "\r\n" — and
+        # if the content already contains "\r\n" (UiPath XAML is CRLF), that
+        # becomes "\r\r\n", which breaks VB.NET expressions spanning lines
+        # (blank-line inside `New With {...}` triggers BC30157 "Leading '.'
+        # can only appear inside a 'With' statement").
+        with open(out_path, "w", encoding="utf-8", newline="") as fp:
             fp.write(modified_content)
         saved += 1
 
@@ -543,11 +622,12 @@ async def accept_fixes(request: Request):
         else:
             pj_path = os.path.join(base_dir, "project.json")
         os.makedirs(os.path.dirname(pj_path), exist_ok=True)
-        with open(pj_path, "w", encoding="utf-8") as fp:
+        with open(pj_path, "w", encoding="utf-8", newline="") as fp:
             fp.write(project_json)
 
     return {
         "saved_path": os.path.abspath(base_dir),
         "file_count": saved,
         "deleted_count": deleted,
+        "passthrough_count": passthrough_count,
     }

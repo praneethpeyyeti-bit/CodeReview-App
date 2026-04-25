@@ -1,13 +1,14 @@
 # UiPath XAML Code Review App
 
-An AI-powered and static analysis code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 38 Workflow Analyzer rules, and auto-fix 17 rules (naming conventions, PascalCase, duplicate display names, default-Studio-name rewrites, shadows, length limits, argument defaults, empty catches, empty sequences, unused variables).
+An AI-powered and static analysis code review tool for UiPath RPA workflows. Upload XAML files or ZIP projects, get instant analysis against 38 Workflow Analyzer rules, and auto-fix 18 rules (naming conventions, PascalCase, duplicate display names, default-Studio-name rewrites, shadows, length limits, argument defaults, empty catches, empty sequences, unused variables, sibling-scope variable disambiguation).
 
 ## Features
 
 - **Static Analysis (default)** — Instant, deterministic results from 37 rule checkers. No UiPath auth, no Agent Units, byte-stable output across runs.
 - **AI-Powered Review (opt-in)** — Deep analysis via Claude / GPT-4o / Gemini through UiPath AI Trust Layer. `temperature=0` + `seed=42` + submission-order batch collection + deterministic post-sort → same input ⇒ same output.
 - **38 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, general quality
-- **Auto-Fix 17 Rules with Convergence Loop** — The fix pipeline runs up to 5 passes with a static re-review between passes, so cascades like `prefix add → length overflow → PascalCase → word-split shorten → default-name rewrite using final names` converge automatically in a single `/api/fix` call
+- **Auto-Fix 18 Rules with Convergence Loop + Post-Pass** — The fix pipeline runs up to 5 passes with a static re-review between passes, so cascades like `prefix add → length overflow → PascalCase → word-split shorten → default-name rewrite using final names` converge automatically in a single `/api/fix` call. After convergence, a post-pass disambiguates sibling-scope variable duplicates and re-runs unused-variable cleanup on any orphans the disambiguation surfaced.
+- **Collision-aware renames** — Prefix-add (ST-NMG-001/002/009/011) and length-shorten (ST-NMG-008/016) rules check `_collect_declared_names` before applying. If the candidate `new_name` is already declared, the rule SKIPS rather than producing a duplicate that UiPath would reject as "name already exists in environment scope". The skip is surfaced in the change log so the user knows why the finding wasn't auto-fixed.
 - **Side-by-Side Diff** — Preview all changes before accepting
 - **Folder Structure Preserved** — Fixed files maintain original ZIP directory layout
 - **Excel Export** — Styled report with executive summary, findings, per-file breakdown, rule coverage
@@ -121,9 +122,9 @@ on purpose, so every new clone has to authenticate once.
 
 Direct API callers that omit `model_id` get static analysis. The UI toggle also opens on Static.
 
-## Auto-Fix Rules (17)
+## Auto-Fix Rules (18)
 
-Text-level operations on raw XAML — safe for UiPath Studio to open without errors.
+Text-level operations on raw XAML — safe for UiPath Studio to open without errors. Renames update declarations AND every reference (simple `[X]` brackets, complex inner-bracket VB expressions like `[X.StartsWith("[")]` and `[String.Format("//*[{0}]", X.Select(...))]`, `ExpressionText="..."` attributes, `Key="X"` argument bindings, and root-level `this:Main.X="value"` attribute defaults).
 
 | Rule | What it Fixes | Method |
 |------|--------------|--------|
@@ -142,9 +143,10 @@ Text-level operations on raw XAML — safe for UiPath Studio to open without err
 | ST-DBP-003 | Insert `<ui:LogMessage Level="Error">` inside empty Catch body (includes exception type, message, source). Auto-adds `xmlns:ui` on the Activity root if missing | ET-guided + positional insertion |
 | ST-DBP-023 | Delete empty workflow file on accept | File-level deletion via fix-response `delete` flag |
 | GEN-001 | Remove unused `<Variable/>` declarations | Element removal |
-| GEN-003 / GEN-REL-001 | Remove empty Sequence elements — both self-closing `<Sequence/>` and open-tag `<Sequence>[metadata only]</Sequence>` | Element removal with metadata-only check |
+| GEN-003 / GEN-REL-001 | Remove empty Sequence elements — self-closing `<Sequence/>`, open-tag `<Sequence>[metadata only]</Sequence>`, and no-DisplayName empty Sequences (matched by IdRef) | Element removal with metadata-only check |
+| ST-NMG-005-SIBLINGS | Disambiguate sibling-scope variable duplicates by suffixing with a bare digit (`dt_FoldersData2`, `dt_FoldersData3`, ...). UiPath flags any cross-scope name reuse as "Variable Overrides Variable" — variables in UiPath are scope-local, so renaming siblings preserves runtime semantics exactly. Scope-bounded rename via owner `WorkflowViewState.IdRef`; ancestor-shadow cases are skipped (already handled by ST-NMG-005). After the pass, GEN-001 re-runs to remove orphan declarations that disambiguation surfaced | Post-convergence ET-guided rename within the owner activity's text span |
 
-After auto-fix, findings for fixed rules show `status = "Fixed"` in the review grid.
+After auto-fix, findings for fixed rules show `status = "Fixed"` in the review grid. Renames that would create a name collision (either with a pre-existing declaration or with another rename's target) are skipped with a `SKIPPED` line in the change log explaining why.
 
 ### Detection-Only Rules (21)
 

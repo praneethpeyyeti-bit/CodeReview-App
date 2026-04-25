@@ -93,6 +93,16 @@ def fix_xaml(xml_content: str, findings: list[Finding]) -> dict:
                 content = result["content"]
                 changes.extend(result["changes"])
                 pass_modified = True
+            else:
+                # Surface SKIPPED-style messages even when the handler made
+                # no edits — these are explicit "I considered the fix and
+                # deliberately didn't apply it" signals (e.g. collision
+                # guards in ST-NMG-001/002/008/016) and the user needs to
+                # see them to understand why a finding wasn't auto-fixed.
+                # Dedupe at the end to avoid repetition across passes.
+                for c in result.get("changes", []):
+                    if "SKIPPED" in c:
+                        changes.append(c)
 
         if not pass_modified or content == last_content:
             break  # converged
@@ -114,10 +124,54 @@ def fix_xaml(xml_content: str, findings: list[Finding]) -> dict:
             # next pass — partial progress is still better than nothing.
             current_findings = list(findings)
 
+    # Post-convergence pass: disambiguate sibling-scope variable duplicates
+    # by suffixing with `_2`, `_3`, ... per occurrence. Runs after all the
+    # finding-driven rules so it sees the final post-rename names. This
+    # rule has no corresponding reviewer finding (UiPath's Workflow Analyzer
+    # flags it as ST-NMG-005 cross-scope; our static reviewer is more
+    # conservative and only flags ancestor shadows).
+    sibling_result = _fix_st_nmg_005_siblings(content, [])
+    if sibling_result.get("modified"):
+        content = sibling_result["content"]
+        changes.extend(sibling_result["changes"])
+
+        # Disambiguation can REVEAL orphan declarations that were previously
+        # hidden by name-collision: if Scope A had `X` actually referenced
+        # in expressions and Scope B had `X` declared but unreferenced, the
+        # flat reviewer treated B's `X` as "used" because the name appeared
+        # in expressions globally. After disambiguation B's becomes `X8`
+        # with zero expression references — genuinely unused. Re-run the
+        # reviewer + GEN-001 unused-variable cleanup once to remove these.
+        try:
+            from services.xaml_parser import parse_xaml_file
+            from services.static_reviewer import review_single_file
+            file_name = findings[0].file_name if findings else "unknown.xaml"
+            zip_entry = findings[0].zip_entry_path if findings else ""
+            ctx = parse_xaml_file(file_name, zip_entry, content)
+            post_findings = review_single_file(ctx, [file_name])
+            unused_findings = [f for f in post_findings if f.rule_id == "GEN-001" and f.auto_fixable]
+            if unused_findings:
+                cleanup = _fix_gen_001(content, unused_findings)
+                if cleanup.get("modified"):
+                    content = cleanup["content"]
+                    changes.extend(cleanup["changes"])
+        except Exception:
+            pass
+
+    # Dedupe while preserving first-seen order — collision-guard SKIPPED
+    # messages can repeat across passes when the same finding is re-flagged
+    # by the re-review.
+    deduped: list[str] = []
+    seen_changes: set[str] = set()
+    for c in changes:
+        if c not in seen_changes:
+            seen_changes.add(c)
+            deduped.append(c)
+
     return {
         "original_content": xml_content,
         "modified_content": content,
-        "changes_applied": changes,
+        "changes_applied": deduped,
         "delete": delete,
     }
 
@@ -188,22 +242,64 @@ def _extract_name_from_finding(finding: Finding, kind: str = "variable") -> str 
     return None
 
 
+def _collect_declared_names(content: str) -> set[str]:
+    """Return the set of all variable + argument names declared in the XAML.
+
+    Used by prefix-rename fixers to detect collisions before renaming.
+    Without this guard, ST-NMG-001/002/009/011 will rename `X` to `prefix_X`
+    even when `prefix_X` is already declared elsewhere — UiPath then rejects
+    the file with "A variable, RuntimeArgument or DelegateArgument already
+    exists with the name 'prefix_X'. Names must be unique within an
+    environment scope."
+    """
+    names: set[str] = set()
+    # Variable declarations: <Variable ... Name="X" .../>
+    for m in re.finditer(r'<Variable\b[^>]*\bName="([^"]+)"', content):
+        names.add(m.group(1))
+    # Argument declarations: <x:Property Name="X" ... /> in x:Members
+    for m in re.finditer(r'<x:Property\b[^>]*\bName="([^"]+)"', content):
+        names.add(m.group(1))
+    return names
+
+
 def _rename_in_xaml(content: str, old_name: str, new_name: str) -> tuple[str, int]:
     """Rename a variable/argument across all locations in XAML content.
 
     Handles:
-      1. Variable/Argument declarations:  Name="oldName"
-      2. Standalone VB expression refs:   [oldName]
-      3. VB expressions with members:     [oldName.ToString()] [oldName & " x"]
-      4. Inside complex expressions:      [CInt(oldName)], [oldName + other]
-      5. Argument key bindings:           Key="oldName"  (InvokeWorkflow arguments)
-      6. Default values with variable:    Default="[oldName]"
-      7. Attribute-form property refs:    this:Main.oldName="value" on the root
-         Activity element (UiPath stores argument defaults this way).
+      1. Variable/Argument declarations:        Name="oldName"
+      2. InvokeWorkflowFile argument keys:      Key="oldName"
+      3. VB expression references (ALL of them):
+           a. inside [...] bracketed expressions — every occurrence, not
+              just the first (e.g. [oldName = oldName + 1], multi-line
+              `New With {.a=oldName, .b=oldName}`).
+           b. inside ExpressionText="..." attribute values on
+              <mva:VisualBasicValue> / <mva:VisualBasicReference> elements
+              (UiPath uses this form heavily for Import Arguments of
+              InvokeWorkflowFile; our earlier bracket-only scan missed it).
+           c. inside attribute-value VB expressions whose body contains
+              inner brackets — e.g. Condition="[X.StartsWith(&quot;[&quot;)]"
+              or Text="[String.Format(&quot;//*[{0}]&quot;, X.Select(...))]".
+              The simple bracket walker in (a) cannot match these
+              because the body contains `[` / `]` characters, so before this
+              fix the rename silently skipped them, leaving expressions
+              referencing the OLD name after the declaration was renamed —
+              UiPath then errors with BC30451 "X is not declared".
+           d. inside element-text VB expressions with inner brackets — e.g.
+              <InArgument>[String.Format("//*[{0}]", X.Select(...))]</InArgument>.
+              Same root cause as (c), but in element text instead of an
+              attribute value.
+      4. Attribute-form property refs on the root Activity:
+           this:Main.oldName="value"
 
     Returns (new_content, replacement_count).
     """
     count = 0
+    # Negative-lookbehind on `.` so we never rewrite property accesses — e.g.
+    # `credential.Password` must stay `.Password` even when an argument named
+    # `Password` is being renamed. Crossing the dot produced
+    # `.out_Password` / `.str_Password` which VB rejects with BC30456
+    # "X is not a member of NetworkCredential" and similar.
+    word_re = re.compile(rf'(?<![\w.])\b{re.escape(old_name)}\b')
 
     # 1. Variable/Argument declaration: Name="oldName"
     pattern = re.compile(rf'\bName="{re.escape(old_name)}"')
@@ -215,23 +311,74 @@ def _rename_in_xaml(content: str, old_name: str, new_name: str) -> tuple[str, in
     content, n = pattern.subn(f'Key="{new_name}"', content)
     count += n
 
-    # 3. VB expression references inside [...] brackets
-    #    Matches oldName as a whole word inside brackets.
-    #    Handles: [oldName], [oldName.Prop], [oldName & "x"], [CInt(oldName)], etc.
-    pattern = re.compile(
-        r'(\[(?:[^\[\]])*?)'
-        rf'\b{re.escape(old_name)}\b'
-        r'((?:[^\[\]])*?\])'
+    # 3a. VB references inside [...] bracketed expressions — rewrite the
+    #     *whole* interior so every occurrence is replaced. The previous
+    #     single-shot regex hit only the first match inside each bracket,
+    #     which left expressions like `[BatchStart = BatchStart + 1000]`
+    #     or `New With {.a = in_X, .b = in_X}` half-renamed and caused
+    #     downstream "variable not declared" / BC30157 errors.
+    def _rewrite_bracket(m: re.Match) -> str:
+        inner = m.group(1)
+        new_inner, k = word_re.subn(new_name, inner)
+        nonlocal count
+        count += k
+        return f'[{new_inner}]'
+    content = re.sub(r'\[([^\[\]]*)\]', _rewrite_bracket, content)
+
+    # 3b. VB references inside ExpressionText="..." attribute values on
+    #     <mva:VisualBasicValue> / <mva:VisualBasicReference> elements.
+    #     These never have surrounding brackets in the attribute itself.
+    def _rewrite_expr_attr(m: re.Match) -> str:
+        prefix, inner, suffix = m.group(1), m.group(2), m.group(3)
+        new_inner, k = word_re.subn(new_name, inner)
+        nonlocal count
+        count += k
+        return f'{prefix}{new_inner}{suffix}'
+    content = re.sub(
+        r'(\bExpressionText=")([^"]*)(")',
+        _rewrite_expr_attr,
+        content,
     )
-    content, n = pattern.subn(rf'\g<1>{new_name}\g<2>', content)
-    count += n
+
+    # 3c. Attribute-value VB expressions whose body contains inner brackets.
+    #     E.g. Condition="[X.StartsWith(&quot;[&quot;)]" or
+    #     Items="[String.Format(&quot;//*[{0}]&quot;, X.Select(...))]".
+    #     The bracket walker in (3a) only matches `[...]` chunks with no inner
+    #     brackets, so it silently skips these and leaves stale references to
+    #     `old_name`. We catch them by recognising the attribute-value shape
+    #     `="[...]"` (body must start with `[` and end with `]`, with no `"`
+    #     in between since attribute values use &quot; for literal quotes).
+    #     For simple `="[X]"` cases this also runs after (3a), but word_re's
+    #     lookbehind `(?<![\w.])` prevents a double rename — once `[X]` has
+    #     become `[new_X]`, the `X` inside `new_X` is preceded by `_` which
+    #     is `\w`, so the lookbehind blocks the second match.
+    def _rewrite_attr_vb_expr(m: re.Match) -> str:
+        prefix, body, suffix = m.group(1), m.group(2), m.group(3)
+        new_body, k = word_re.subn(new_name, body)
+        nonlocal count
+        count += k
+        return f'{prefix}{new_body}{suffix}'
+    content = re.sub(r'(=")(\[[^"]*\])(")', _rewrite_attr_vb_expr, content)
+
+    # 3d. Element-text VB expressions with inner brackets — same root cause
+    #     as (3c), but in `<InArgument>[...]</InArgument>` style text content
+    #     rather than an attribute value. Body must start with `[` and end
+    #     with `]` and contain no `<` (which would mean we crossed a tag
+    #     boundary). VB expressions encode `<` as `&lt;` so this is safe.
+    def _rewrite_element_text_vb_expr(m: re.Match) -> str:
+        prefix, body, suffix = m.group(1), m.group(2), m.group(3)
+        new_body, k = word_re.subn(new_name, body)
+        nonlocal count
+        count += k
+        return f'{prefix}{new_body}{suffix}'
+    content = re.sub(
+        r'(>\s*)(\[[^<]*\])(\s*<)',
+        _rewrite_element_text_vb_expr,
+        content,
+    )
 
     # 4. Attribute-form property references on the Activity root:
     #    e.g. this:Main.oldName="default value"
-    #    These flatten the property element syntax into an attribute, and
-    #    reference the argument by class-name.argName. When the argument is
-    #    renamed, the attribute suffix must track the new name or UiPath
-    #    Studio raises "The property (oldName) is either invalid or not defined".
     pattern = re.compile(
         r'(\s[\w]+:[\w]+\.)' + re.escape(old_name) + r'(=")'
     )
@@ -247,6 +394,7 @@ def _fix_naming_variable(content: str, findings: list[Finding], expected_prefix:
     changes = []
     new_content = content
     seen = set()
+    declared = _collect_declared_names(new_content)
 
     for f in findings:
         var_name = _extract_name_from_finding(f, "variable")
@@ -258,9 +406,14 @@ def _fix_naming_variable(content: str, findings: list[Finding], expected_prefix:
             continue
 
         new_name = expected_prefix + var_name
+        if new_name in declared:
+            changes.append(f"{f.rule_id}: SKIPPED rename '{var_name}' -> '{new_name}' (name collision: '{new_name}' is already declared)")
+            continue
         new_content, count = _rename_in_xaml(new_content, var_name, new_name)
         if count > 0:
             modified = True
+            declared.discard(var_name)
+            declared.add(new_name)
             changes.append(f"{f.rule_id}: Renamed variable '{var_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
@@ -272,6 +425,7 @@ def _fix_naming_argument(content: str, findings: list[Finding], expected_prefix:
     changes = []
     new_content = content
     seen = set()
+    declared = _collect_declared_names(new_content)
 
     for f in findings:
         arg_name = _extract_name_from_finding(f, "argument")
@@ -283,9 +437,14 @@ def _fix_naming_argument(content: str, findings: list[Finding], expected_prefix:
             continue
 
         new_name = expected_prefix + arg_name
+        if new_name in declared:
+            changes.append(f"{f.rule_id}: SKIPPED rename '{arg_name}' -> '{new_name}' (name collision: '{new_name}' is already declared)")
+            continue
         new_content, count = _rename_in_xaml(new_content, arg_name, new_name)
         if count > 0:
             modified = True
+            declared.discard(arg_name)
+            declared.add(new_name)
             changes.append(f"{f.rule_id}: Renamed argument '{arg_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
@@ -300,37 +459,41 @@ def _fix_st_nmg_001(content: str, findings: list[Finding]) -> dict:
     new_content = content
     seen = set()
 
+    # Trust the reviewer's prefix directly — it's already computed against the
+    # full type string and placed in the `Expected prefix 'X'` section of the
+    # finding. Keyword matching on the description text missed `arr_`/`dic_`
+    # and defaulted to `str_`, which then caused wrong renames like
+    # `str_UnprocessedQueuesDetails` on a `DataRow[]` variable.
+    prefix_re = re.compile(r"Expected prefix '([a-z_]+)'")
+    declared = _collect_declared_names(new_content)
+
     for f in findings:
         var_name = _extract_name_from_finding(f, "variable")
         if not var_name or var_name in seen:
             continue
         seen.add(var_name)
 
-        # Determine expected prefix from the variable type mentioned in description
-        expected_prefix = "str_"  # default
-        desc_lower = f.description.lower()
-        if "int32" in desc_lower or "int64" in desc_lower or "integer" in desc_lower:
-            expected_prefix = "int_"
-        elif "boolean" in desc_lower or "bool" in desc_lower:
-            expected_prefix = "bln_"
-        elif "datatable" in desc_lower:
-            expected_prefix = "dt_"
-        elif "datetime" in desc_lower:
-            expected_prefix = "dtm_"
-        elif "timespan" in desc_lower:
-            expected_prefix = "ts_"
-        elif "array" in desc_lower or "list" in desc_lower:
-            expected_prefix = "arr_"
-        elif "dictionary" in desc_lower:
-            expected_prefix = "dic_"
+        m = prefix_re.search(f.description or "")
+        if not m:
+            continue  # can't determine prefix — skip rather than guess
+        expected_prefix = m.group(1)
 
         if var_name.startswith(expected_prefix):
             continue
 
         new_name = expected_prefix + var_name
+        # Collision guard: if `new_name` is already a declared variable or
+        # argument, renaming would create a duplicate that UiPath rejects
+        # ("Names must be unique within an environment scope"). Skip rather
+        # than corrupt the workflow.
+        if new_name in declared:
+            changes.append(f"ST-NMG-001: SKIPPED rename '{var_name}' -> '{new_name}' (name collision: '{new_name}' is already declared)")
+            continue
         new_content, count = _rename_in_xaml(new_content, var_name, new_name)
         if count > 0:
             modified = True
+            declared.discard(var_name)
+            declared.add(new_name)
             changes.append(f"ST-NMG-001: Renamed variable '{var_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
@@ -342,6 +505,7 @@ def _fix_st_nmg_002(content: str, findings: list[Finding]) -> dict:
     changes = []
     new_content = content
     seen = set()
+    declared = _collect_declared_names(new_content)
 
     for f in findings:
         arg_name = _extract_name_from_finding(f, "argument")
@@ -361,9 +525,15 @@ def _fix_st_nmg_002(content: str, findings: list[Finding]) -> dict:
             continue
 
         new_name = expected_prefix + arg_name
+        # Collision guard — see ST-NMG-001 for rationale.
+        if new_name in declared:
+            changes.append(f"ST-NMG-002: SKIPPED rename '{arg_name}' -> '{new_name}' (name collision: '{new_name}' is already declared)")
+            continue
         new_content, count = _rename_in_xaml(new_content, arg_name, new_name)
         if count > 0:
             modified = True
+            declared.discard(arg_name)
+            declared.add(new_name)
             changes.append(f"ST-NMG-002: Renamed argument '{arg_name}' -> '{new_name}' ({count} location(s))")
 
     return {"modified": modified, "content": new_content, "changes": changes}
@@ -566,46 +736,323 @@ def _shorten_name(name: str, limit: int = 28) -> str | None:
     return new_name
 
 
+# ── ST-NMG-005-SIBLINGS: Disambiguate sibling-scope duplicate variables ──
+
+# Activity types that own a variable scope. A variable's "owner" is the
+# nearest ancestor of one of these types.
+_VARIABLE_OWNER_TYPES: frozenset = frozenset({
+    "Sequence", "NSequence",
+    "Flowchart", "StateMachine",
+    "TryCatch",
+    "While", "DoWhile", "ForEach", "ForEachRow",
+    "If", "Switch", "Pick",
+})
+
+
+def _scope_bounded_rename(content: str, span_start: int, span_end: int,
+                           old_name: str, new_name: str) -> tuple[str, int]:
+    """Apply ``_rename_in_xaml`` semantics restricted to ``[span_start, span_end)``.
+
+    Used by sibling-disambiguation: each duplicate-name owner has its OWN
+    text range, and we must rename the variable + every reference to it
+    within that range only — leaving siblings' references intact.
+    """
+    if span_start >= span_end:
+        return content, 0
+    before = content[:span_start]
+    middle = content[span_start:span_end]
+    after = content[span_end:]
+    new_middle, n = _rename_in_xaml(middle, old_name, new_name)
+    return before + new_middle + after, n
+
+
+def _find_owner_text_span(content: str, owner_type: str, owner_idref: str) -> tuple[int, int] | None:
+    """Find the start..end byte offsets of a specific activity element by IdRef.
+
+    Walks raw text rather than ET so we can return positions for scope-
+    bounded rewrites. Handles namespaced types (``ui:Sequence`` etc.) and
+    nested same-type elements (counts depth as we scan).
+    """
+    # `(?=[\s/>])` excludes property elements like `<Sequence.Variables>` —
+    # a `\b` boundary would let `.Variables` through as `attrs`, which then
+    # increments depth without a matching `</Sequence.Variables>` (close
+    # regex requires `\s*>`), corrupting the balance and making the search
+    # fail entirely for any owner that comes after a property-element open.
+    open_re = re.compile(
+        r"<(?P<ns>\w+:)?" + re.escape(owner_type) +
+        r"(?=[\s/>])(?P<attrs>[^>]*?)(?P<close>/?>)",
+        re.DOTALL,
+    )
+    close_re = re.compile(
+        r"</(?:\w+:)?" + re.escape(owner_type) + r"\s*>",
+    )
+
+    # Find the opening tag whose attributes contain the matching IdRef
+    target_open = None
+    for m in open_re.finditer(content):
+        attrs = m.group("attrs") or ""
+        if f'IdRef="{owner_idref}"' in attrs:
+            target_open = m
+            break
+    if target_open is None:
+        return None
+
+    # Self-closing — span is just the tag itself
+    if (target_open.group("close") or "").strip() == "/>":
+        return target_open.start(), target_open.end()
+
+    # Walk forward, balancing nested same-type opens against closes
+    depth = 1
+    pos = target_open.end()
+    while pos < len(content) and depth > 0:
+        next_open = open_re.search(content, pos)
+        next_close = close_re.search(content, pos)
+        if next_close is None:
+            return None  # malformed
+        if next_open is not None and next_open.start() < next_close.start():
+            # Skip self-closing same-type opens (they don't increment depth)
+            if (next_open.group("close") or "").strip() != "/>":
+                depth += 1
+            pos = next_open.end()
+        else:
+            depth -= 1
+            pos = next_close.end()
+    if depth != 0:
+        return None
+    return target_open.start(), pos
+
+
+def _fix_st_nmg_005_siblings(content: str, findings: list[Finding]) -> dict:
+    """Disambiguate variables declared with the same name in different
+    sibling scopes by suffixing with `_2`, `_3`, ... per occurrence.
+
+    UiPath's ST-NMG-005 ("Variable Overrides Variable") flags ANY cross-
+    scope name reuse — even when the scopes are independent siblings rather
+    than parent/child shadows. Renaming siblings is safe because variables
+    in UiPath are strictly scope-local: each sibling owner has its own
+    independent variable, and references inside that owner's text span
+    resolve to the local declaration only.
+
+    Algorithm:
+      1. Walk every <Variable> with ET; record each with its OWNER (the
+         nearest variable-holding ancestor activity) and the owner's IdRef.
+      2. Group by name. The first occurrence keeps the original name. Each
+         subsequent occurrence gets `name_2`, `name_3`, ... and is renamed
+         within its owner's text span only.
+      3. Skip true shadows (handled by `_fix_st_nmg_005`); this rule only
+         disambiguates non-shadowing siblings.
+
+    Note: this rule has no corresponding reviewer finding in our static
+    reviewer (which only flags ancestor shadows). It runs unconditionally
+    after the ancestor-shadow remover so it sees the post-shadow-removal
+    state.
+    """
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return {"modified": False, "content": content, "changes": []}
+
+    def _lname(tag: str) -> str:
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    parent_map: dict[ET.Element, ET.Element] = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[child] = parent
+
+    SAP2010_NS = "http://schemas.microsoft.com/netfx/2010/xaml/activities/presentation"
+    IDREF_ATTR = f"{{{SAP2010_NS}}}WorkflowViewState.IdRef"
+
+    # Collect Variables with owner info, in document order
+    variables: list[tuple[str, str, str]] = []  # (name, owner_type, owner_idref)
+    name_owners: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    ancestor_names_by_owner: dict[int, set[str]] = {}
+
+    # First pass: index every owning activity's declared variable names
+    # so we can detect (and skip) ancestor-shadow cases.
+    for elem in root.iter():
+        if _lname(elem.tag) != "Variable":
+            continue
+        prop = parent_map.get(elem)
+        owner = parent_map.get(prop) if prop is not None else None
+        if owner is None:
+            continue
+        name = elem.attrib.get("Name", "")
+        if name:
+            ancestor_names_by_owner.setdefault(id(owner), set()).add(name)
+
+    for elem in root.iter():
+        if _lname(elem.tag) != "Variable":
+            continue
+        name = elem.attrib.get("Name", "")
+        if not name:
+            continue
+        prop = parent_map.get(elem)
+        owner = parent_map.get(prop) if prop is not None else None
+        if owner is None:
+            continue
+        owner_type = _lname(owner.tag)
+        if owner_type not in _VARIABLE_OWNER_TYPES:
+            continue
+        owner_idref = owner.attrib.get(IDREF_ATTR, "")
+        if not owner_idref:
+            # No IdRef = can't precisely identify the owner's text span. Skip
+            # rather than risk a global rename that bleeds across scopes.
+            continue
+
+        # Skip if this is an ancestor shadow (ST-NMG-005 already handles those)
+        cur: ET.Element | None = parent_map.get(owner)
+        is_shadow = False
+        while cur is not None:
+            if name in ancestor_names_by_owner.get(id(cur), set()):
+                is_shadow = True
+                break
+            cur = parent_map.get(cur)
+        if is_shadow:
+            continue
+
+        name_owners[name].append((owner_type, owner_idref))
+
+    # For each name with 2+ sibling owners, rename occurrences 2..N.
+    # Suffix with a bare digit (no underscore) so PascalCase validity is
+    # preserved — `dt_FoldersData_2` would have body `FoldersData_2` which
+    # ST-NMG-010 rejects (underscore in body); `dt_FoldersData2` keeps body
+    # `FoldersData2` which is valid PascalCase (digit on the end is fine).
+    new_content = content
+    changes: list[str] = []
+    for name in sorted(name_owners):
+        owners = name_owners[name]
+        if len(owners) < 2:
+            continue
+        for n, (owner_type, owner_idref) in enumerate(owners[1:], start=2):
+            new_name = f"{name}{n}"
+            span = _find_owner_text_span(new_content, owner_type, owner_idref)
+            if span is None:
+                continue
+            start, end = span
+            new_content, k = _scope_bounded_rename(new_content, start, end, name, new_name)
+            if k > 0:
+                changes.append(
+                    f"ST-NMG-005-SIBLINGS: Disambiguated sibling variable "
+                    f"'{name}' -> '{new_name}' in {owner_type}#{owner_idref} "
+                    f"({k} location(s))"
+                )
+
+    if not changes:
+        return {"modified": False, "content": content, "changes": []}
+    return {"modified": True, "content": new_content, "changes": changes}
+
+
 # ── ST-NMG-005: Remove inner shadow variable declarations ──────────
 
 def _fix_st_nmg_005(content: str, findings: list[Finding]) -> dict:
-    """ST-NMG-005: Keep the outermost Variable declaration, remove shadows.
+    """ST-NMG-005: Remove only the specific inner-scope Variable that
+    shadows an outer declaration — never touch sibling sub-sequence
+    declarations.
 
-    A variable declared in multiple scopes shadows itself. We keep the first
-    occurrence (outermost in document order) and remove the rest. References
-    in inner scopes resolve to the outer variable instead.
+    Algorithm:
+
+    1. Parse the XAML with ET and walk every ``<Variable>`` in document order.
+       For each, compute the ancestor-activity chain (skipping property-
+       element wrappers like ``<Sequence.Variables>``). A variable is a
+       shadow iff some *strict* ancestor activity also declares the same
+       name — ancestor-aware, NOT global-first-wins.
+
+    2. Find every ``<Variable .../>`` occurrence in the raw text in document
+       order. ET.iter() yields variables in the same order, so index i in
+       the text list corresponds to index i in the ET list. Remove only the
+       specific text spans whose corresponding ET variable was flagged as
+       a nested shadow. Sibling sub-sequence declarations are left untouched.
     """
-    modified = False
-    changes = []
-    new_content = content
-    seen = set()
+    if not findings:
+        return {"modified": False, "content": content, "changes": []}
 
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return {"modified": False, "content": content, "changes": []}
+
+    def _lname(tag: str) -> str:
+        return tag.split("}", 1)[-1] if "}" in tag else tag
+
+    parent_map: dict[ET.Element, ET.Element] = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[child] = parent
+
+    # Gather every Variable in document order with its owner and ancestor chain.
+    all_vars_et: list[tuple[ET.Element, str, ET.Element | None, list[ET.Element]]] = []
+    names_by_activity: dict[int, set[str]] = {}
+    for elem in root.iter():
+        if _lname(elem.tag) != "Variable":
+            continue
+        name = elem.attrib.get("Name", "")
+        if not name:
+            # Still track position so the ET list stays aligned with the
+            # text list (which will also include nameless Variables).
+            all_vars_et.append((elem, "", None, []))
+            continue
+        prop = parent_map.get(elem)
+        owner = parent_map.get(prop) if prop is not None else None
+        if owner is None:
+            all_vars_et.append((elem, name, None, []))
+            continue
+        names_by_activity.setdefault(id(owner), set()).add(name)
+        chain: list[ET.Element] = []
+        cur: ET.Element | None = owner
+        while cur is not None:
+            if "." not in _lname(cur.tag):
+                chain.append(cur)
+            cur = parent_map.get(cur)
+        all_vars_et.append((elem, name, owner, chain))
+
+    # Determine which ET variables are true nested shadows.
+    target_names = set()
     for f in findings:
-        name = _extract_name_from_finding(f, "variable")
-        if not name or name in seen:
-            continue
-        seen.add(name)
+        n = _extract_name_from_finding(f, "variable")
+        if n:
+            target_names.add(n)
 
-        pattern = re.compile(
-            r'\s*<Variable\b[^>]*\bName="' + re.escape(name) + r'"[^>]*/>\s*',
-            re.DOTALL,
+    shadow_indices: set[int] = set()
+    shadow_names_counter: dict[str, int] = {}
+    for i, (_elem, name, _owner, chain) in enumerate(all_vars_et):
+        if not name or name not in target_names:
+            continue
+        ancestors = chain[1:]  # strict ancestors only
+        shadowed = any(
+            name in names_by_activity.get(id(anc), set()) for anc in ancestors
         )
-        matches = list(pattern.finditer(new_content))
-        if len(matches) < 2:
-            continue
+        if shadowed:
+            shadow_indices.add(i)
+            shadow_names_counter[name] = shadow_names_counter.get(name, 0) + 1
 
-        # Remove all but the first, from end to preserve offsets
-        removed = 0
-        for m in reversed(matches[1:]):
-            new_content = new_content[:m.start()] + "\n" + new_content[m.end():]
-            removed += 1
-        if removed:
-            modified = True
-            changes.append(
-                f"ST-NMG-005: Removed {removed} inner-scope shadow declaration(s) of '{name}'"
-            )
+    if not shadow_indices:
+        return {"modified": False, "content": content, "changes": []}
 
-    return {"modified": modified, "content": new_content, "changes": changes}
+    # Find every <Variable .../> span in the raw text in document order.
+    text_spans = list(re.finditer(
+        r'\s*<(?:\w+:)?Variable\b[^>]*/>\s*',
+        content,
+        re.DOTALL,
+    ))
+
+    if len(text_spans) != len(all_vars_et):
+        # Mismatch means document contains non-self-closing <Variable>...</Variable>
+        # forms or CDATA oddities we didn't account for. Bail out rather than
+        # risk removing the wrong element.
+        return {"modified": False, "content": content, "changes": []}
+
+    new_content = content
+    # Remove from end to preserve earlier offsets.
+    for i in sorted(shadow_indices, reverse=True):
+        span = text_spans[i]
+        new_content = new_content[:span.start()] + "\n" + new_content[span.end():]
+
+    changes = [
+        f"ST-NMG-005: Removed {count} inner-scope shadow declaration(s) of '{name}'"
+        for name, count in sorted(shadow_names_counter.items())
+    ]
+    return {"modified": True, "content": new_content, "changes": changes}
 
 
 # ── ST-NMG-006: Remove variable that collides with an argument ─────
@@ -789,6 +1236,16 @@ def _fix_st_nmg_008(content: str, findings: list[Finding]) -> dict:
     composes with earlier fixers — e.g. when ST-NMG-001 adds a `str_` prefix
     and the result is still too long, or when ST-NMG-010 expands a
     concatenated lowercase run into a long PascalCase name.
+
+    Collision guard: the middle-word-drop algorithm in ``_shorten_name`` can
+    produce identical shortened names from distinct originals (e.g. both
+    ``URLSpecificCredentialTarget`` and ``URLTenantSpecificCredentialTarget``
+    shorten to ``URLCredentialTarget``). UiPath then refuses to load the file
+    with "A variable, RuntimeArgument or DelegateArgument already exists with
+    the name 'X'. Names must be unique within an environment scope." So we
+    pre-compute every proposed shortening, detect collisions against (a) other
+    proposed shortenings in this pass and (b) any name already declared in the
+    file, and skip the colliding entries with a SKIPPED log line.
     """
     if not findings:
         return {"modified": False, "content": content, "changes": []}
@@ -803,6 +1260,8 @@ def _fix_st_nmg_008(content: str, findings: list[Finding]) -> dict:
     for m in re.finditer(r'<Variable\b[^>]*\bName="([^"]+)"', new_content):
         current_names.add(m.group(1))
 
+    # Pre-compute proposals so we can detect within-pass collisions.
+    proposed: dict[str, str] = {}
     for name in sorted(current_names):
         if name in seen or len(name) <= 30:
             continue
@@ -810,11 +1269,38 @@ def _fix_st_nmg_008(content: str, findings: list[Finding]) -> dict:
         short = _shorten_name(name, limit=28)
         if not short or short == name:
             continue
-        new_content, count = _rename_in_xaml(new_content, name, short)
+        proposed[name] = short
+
+    # Group by target — any target reached by 2+ originals is a collision.
+    by_target: dict[str, list[str]] = {}
+    for old, new in proposed.items():
+        by_target.setdefault(new, []).append(old)
+
+    declared = _collect_declared_names(new_content)
+    for new, olds in sorted(by_target.items()):
+        # Collision case 1: multiple originals → same shortened name.
+        if len(olds) > 1:
+            for old in olds:
+                changes.append(
+                    f"ST-NMG-008: SKIPPED shorten '{old}' -> '{new}' "
+                    f"(name collision: would also be the shortened form of {[o for o in olds if o != old]})"
+                )
+            continue
+        old = olds[0]
+        # Collision case 2: shortened name already declared (variable or arg).
+        if new in declared and new != old:
+            changes.append(
+                f"ST-NMG-008: SKIPPED shorten '{old}' -> '{new}' "
+                f"(name collision: '{new}' is already declared)"
+            )
+            continue
+        new_content, count = _rename_in_xaml(new_content, old, new)
         if count > 0:
             modified = True
+            declared.discard(old)
+            declared.add(new)
             changes.append(
-                f"ST-NMG-008: Shortened variable '{name}' -> '{short}' ({count} location(s))"
+                f"ST-NMG-008: Shortened variable '{old}' -> '{new}' ({count} location(s))"
             )
 
     return {"modified": modified, "content": new_content, "changes": changes}
@@ -878,6 +1364,14 @@ def _fix_st_nmg_016(content: str, findings: list[Finding]) -> dict:
 
     Re-scans the *current* XAML for `<x:Property>` declarations so the rule
     composes correctly after ST-NMG-002/010/011 apply their renames.
+
+    Collision guard: same as ST-NMG-008. The middle-word-drop algorithm in
+    ``_shorten_name`` can map distinct originals to the same shortened name
+    (e.g. ``in_FolderMigrationTemplateFilePath`` and
+    ``in_FolderMigrationWorkbookFilePath`` both shorten to
+    ``in_FolderMigrationFilePath``). Without this guard the resulting XAML
+    has two arguments with the same key and UiPath fails to load it with
+    "An item with the same key has already been added".
     """
     if not findings:
         return {"modified": False, "content": content, "changes": []}
@@ -891,6 +1385,7 @@ def _fix_st_nmg_016(content: str, findings: list[Finding]) -> dict:
     for m in re.finditer(r'<x:Property\b[^>]*\bName="([^"]+)"', new_content):
         current_names.add(m.group(1))
 
+    proposed: dict[str, str] = {}
     for name in sorted(current_names):
         if name in seen or len(name) <= 30:
             continue
@@ -898,34 +1393,38 @@ def _fix_st_nmg_016(content: str, findings: list[Finding]) -> dict:
         short = _shorten_name(name, limit=28)
         if not short or short == name:
             continue
-        new_content, count = _rename_in_xaml(new_content, name, short)
+        proposed[name] = short
+
+    by_target: dict[str, list[str]] = {}
+    for old, new in proposed.items():
+        by_target.setdefault(new, []).append(old)
+
+    declared = _collect_declared_names(new_content)
+    for new, olds in sorted(by_target.items()):
+        if len(olds) > 1:
+            for old in olds:
+                changes.append(
+                    f"ST-NMG-016: SKIPPED shorten '{old}' -> '{new}' "
+                    f"(name collision: would also be the shortened form of {[o for o in olds if o != old]})"
+                )
+            continue
+        old = olds[0]
+        if new in declared and new != old:
+            changes.append(
+                f"ST-NMG-016: SKIPPED shorten '{old}' -> '{new}' "
+                f"(name collision: '{new}' is already declared)"
+            )
+            continue
+        new_content, count = _rename_in_xaml(new_content, old, new)
         if count > 0:
             modified = True
+            declared.discard(old)
+            declared.add(new)
             changes.append(
-                f"ST-NMG-016: Shortened argument '{name}' -> '{short}' ({count} location(s))"
+                f"ST-NMG-016: Shortened argument '{old}' -> '{new}' ({count} location(s))"
             )
 
     return {"modified": modified, "content": new_content, "changes": changes}
-
-
-# ── ST-DBP-023: Mark empty workflow for deletion ──────────────────
-
-def _fix_st_dbp_023(content: str, findings: list[Finding]) -> dict:
-    """ST-DBP-023: Mark the file for deletion.
-
-    Empty workflows have no meaningful activities. The fix is to delete the
-    whole file. This handler signals the deletion via the `delete` key in the
-    result; the orchestrator in main.py turns that into a filesystem delete
-    on accept.
-    """
-    if not findings:
-        return {"modified": False, "content": content, "changes": []}
-    return {
-        "modified": False,
-        "content": content,
-        "changes": [f"ST-DBP-023: Marked empty workflow for deletion ({len(findings)} finding(s))"],
-        "delete": True,
-    }
 
 
 # ── GEN-REL-001 / GEN-003: Remove empty Sequence elements ─────────
@@ -1008,6 +1507,44 @@ def _fix_gen_rel_001(content: str, findings: list[Finding]) -> dict:
         if name_removed:
             changes.append(f"GEN-REL-001: Removed empty Sequence '{name}'")
 
+    # Form 3: no-DisplayName Sequences. When the reviewer flagged a Sequence
+    # whose name fell back to the bare type ("Sequence"), the matchers above
+    # can't find it — those elements have no DisplayName attribute at all,
+    # only IdRef. Sweep for `<Sequence>` opening tags that LACK DisplayName
+    # and either self-close or wrap metadata-only content. The metadata-only
+    # guard prevents removing real activity bodies.
+    if "Sequence" in flagged or "NSequence" in flagged:
+        # Self-closing without DisplayName
+        no_dn_self = re.compile(
+            r"\s*<(?:\w+:)?[NS]equence\b(?![^>]*\bDisplayName=)[^>]*/>\s*",
+            re.DOTALL,
+        )
+        new_text, n_self = no_dn_self.subn("\n", new_content)
+        if n_self > 0:
+            new_content = new_text
+            changes.append(f"GEN-REL-001: Removed {n_self} self-closing Sequence(s) with no DisplayName")
+
+        # Open-close without DisplayName, metadata-only inner
+        no_dn_open = re.compile(
+            r"(\s*)<(?:\w+:)?[NS]equence\b(?![^>]*\bDisplayName=)[^>]*>(.*?)</(?:\w+:)?[NS]equence>\s*",
+            re.DOTALL,
+        )
+
+        removed_count = [0]
+        def _maybe_drop_no_dn(m: re.Match) -> str:
+            inner = m.group(2)
+            if _inner_is_metadata_only(inner):
+                removed_count[0] += 1
+                return "\n"
+            return m.group(0)
+
+        new_text = no_dn_open.sub(_maybe_drop_no_dn, new_content)
+        if removed_count[0] > 0:
+            new_content = new_text
+            changes.append(
+                f"GEN-REL-001: Removed {removed_count[0]} empty Sequence(s) with no DisplayName"
+            )
+
     if not changes:
         return {"modified": False, "content": content, "changes": []}
 
@@ -1034,6 +1571,37 @@ _GENERIC_DISPLAY_NAMES = {
 
 def _local_tag(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
+
+
+# Namespace URI fragments identifying elements that are never activities and
+# therefore must not receive a DisplayName injection. UiPath Studio's XAML
+# loader rejects DisplayName on e.g. List<AssemblyReference>, x:String, etc.
+# with: "Cannot set unknown member '...List(...AssemblyReference).DisplayName'".
+_NON_ACTIVITY_NS_FRAGMENTS: tuple[str, ...] = (
+    "System.Collections",            # scg:List, scg:Dictionary, scg:HashSet, etc.
+    "System.Collections.Generic",
+    "System.Collections.ObjectModel",
+    "schemas.microsoft.com/winfx/2006/xaml",  # x:String, x:Boolean, x:Reference, x:Static, x:Array…
+)
+
+
+def _is_non_activity_element(elem) -> bool:
+    """True if the element is a typed collection, XAML primitive, VB
+    expression, or a .NET Attribute class — i.e. anything that must not be
+    treated as an activity for DisplayName insertion/rename purposes."""
+    tag = elem.tag
+    if "}" in tag:
+        ns = tag.split("}", 1)[0][1:]  # strip leading '{'
+        for frag in _NON_ACTIVITY_NS_FRAGMENTS:
+            if frag in ns:
+                return True
+    # Any class whose name ends in `Attribute` is a .NET attribute type and
+    # cannot accept a DisplayName. This covers RequiredArgumentAttribute,
+    # OverloadGroupAttribute, DefaultValueAttribute, DescriptionAttribute, etc.
+    local = tag.split("}")[-1] if "}" in tag else tag
+    if local.endswith("Attribute") and local != "Attribute":
+        return True
+    return False
 
 
 def _extract_selector_descriptor(selector: str) -> str | None:
@@ -1259,10 +1827,20 @@ def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
         "TextExpression", "Literal", "AssemblyReference",
         "String", "Boolean", "Int32", "Int64", "Double", "Decimal",
         "Collection", "Dictionary",
+        "List", "HashSet", "Queue", "Stack", "LinkedList",
+        "SortedList", "SortedDictionary", "ObservableCollection",
+        "VisualBasicValue", "VisualBasicReference",
+        "LambdaValue", "LambdaReference",
+        "RequiredArgument", "RequiredArgumentAttribute",
+        "OverloadGroup", "OverloadGroupAttribute",
+        "DefaultValue", "DefaultValueAttribute",
+        "FilterOperationArgument",
         "WorkflowViewState", "ViewState",
     }
     activities: list[tuple[str, str, bool, str | None]] = []
     for elem in root.iter():
+        if _is_non_activity_element(elem):
+            continue
         type_name = _local_tag(elem.tag)
         if type_name in skip_tags or "." in type_name:
             continue
@@ -1393,6 +1971,10 @@ _NMG020_SKIP_TAGS: frozenset = frozenset({
     "TextExpression", "Literal", "AssemblyReference",
     "String", "Boolean", "Int32", "Int64", "Double", "Decimal",
     "Collection", "Dictionary",
+    "List", "HashSet", "Queue", "Stack", "LinkedList",
+    "SortedList", "SortedDictionary", "ObservableCollection",
+    "VisualBasicValue", "VisualBasicReference",
+    "LambdaValue", "LambdaReference",
     "WorkflowViewState", "ViewState",
 })
 
@@ -1417,6 +1999,8 @@ def _fix_st_nmg_020(content: str, findings: list[Finding]) -> dict:
     # Walk doc order and collect activities to rename plus their descriptors
     to_rename: list[tuple[str, str, bool, str]] = []  # (type, effective_dn, explicit, descriptor)
     for elem in root.iter():
+        if _is_non_activity_element(elem):
+            continue
         tn = _local_tag(elem.tag)
         if tn in _NMG020_STRUCTURAL or tn in _NMG020_SKIP_TAGS or "." in tn:
             continue
@@ -1784,7 +2368,6 @@ _FIX_HANDLERS: dict[str, Callable] = {
     "ST-DBP-003": _fix_st_dbp_003,
     "ST-DBP-007": _noop_fix,
     "ST-DBP-020": _noop_fix,
-    "ST-DBP-023": _fix_st_dbp_023,
     "ST-DBP-024": _noop_fix,
     "ST-DBP-025": _noop_fix,
     "ST-DBP-026": _noop_fix,

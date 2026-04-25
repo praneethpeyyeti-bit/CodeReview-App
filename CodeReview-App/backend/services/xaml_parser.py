@@ -16,14 +16,46 @@ _META_ELEMENTS = {
     "Variable", "Property", "Members", "TextExpression", "Literal",
     "String", "Boolean", "Int32", "Int64", "Double", "Decimal",
     "AssemblyReference", "Collection", "Dictionary",
+    "List", "HashSet", "Queue", "Stack", "LinkedList",
+    "SortedList", "SortedDictionary", "ObservableCollection",
     "DelegateInArgument", "DelegateOutArgument",
     "ActivityAction", "InArgument", "OutArgument", "InOutArgument",
+    "VisualBasicValue", "VisualBasicReference",
+    "LambdaValue", "LambdaReference",
+    # Property-attribute metadata (children of <x:Property.Attributes>) —
+    # these are .NET attributes, not activities. Injecting DisplayName here
+    # breaks Studio with "Cannot set unknown member 'X.DisplayName'".
+    # XAML serialisers emit both the short form and the full *Attribute name;
+    # list both so we catch whichever variant the project uses.
+    "RequiredArgument", "RequiredArgumentAttribute",
+    "OverloadGroup", "OverloadGroupAttribute",
+    "DefaultValue", "DefaultValueAttribute",
+    "FilterOperationArgument",
     "WorkflowViewState", "ViewState",
     # x:* XAML primitives that show up in VisualBasic.Settings,
     # ViewState dictionaries, etc. Without explicit exclusion they
     # leak into ctx.activities as type_name="Null"/"Reference"/etc.
     "Null", "Reference", "Type", "Static", "StaticResource",
 }
+
+# Namespace URI fragments identifying elements that are never activities.
+# Anchoring on the namespace catches typed generics (scg:List<T>, etc.) that
+# cannot be enumerated by local name alone.
+_NON_ACTIVITY_NS_FRAGMENTS: tuple[str, ...] = (
+    "System.Collections",
+    "System.Collections.Generic",
+    "System.Collections.ObjectModel",
+    "schemas.microsoft.com/winfx/2006/xaml",
+)
+
+
+def _is_non_activity_ns(tag: str) -> bool:
+    if "}" in tag:
+        ns = tag.split("}", 1)[0][1:]
+        for frag in _NON_ACTIVITY_NS_FRAGMENTS:
+            if frag in ns:
+                return True
+    return False
 
 # UI container activity types
 _CONTAINER_TYPES = {
@@ -106,10 +138,41 @@ def _extract_variables(root: ET.Element) -> list[VariableSummary]:
         for child in parent:
             parent_map[child] = parent
 
-    # Assign each owner element a unique index so two structurally-similar
-    # Sequences (same tag name, same DisplayName, missing IdRef) still produce
-    # distinct scopes for their variables.
-    owner_ids: dict[int, str] = {}
+    # Assign each element a unique, stable scope ID. We use this both for the
+    # owner of a Variable and for every ancestor of that owner (so we can
+    # compute an ancestor chain that distinguishes nested scopes from
+    # sibling scopes declaring the same variable name).
+    scope_ids: dict[int, str] = {}
+
+    def _scope_id_for(elem: ET.Element) -> str:
+        key = id(elem)
+        cached = scope_ids.get(key)
+        if cached is not None:
+            return cached
+        ref_val = ""
+        for k, v in elem.attrib.items():
+            if k.endswith("}IdRef") or k.endswith(":IdRef") or k == "IdRef":
+                ref_val = v
+                break
+        if ref_val:
+            label = ref_val
+        else:
+            tag = _local_name(elem.tag)
+            display = elem.attrib.get("DisplayName", "")
+            xkey = ""
+            for k, v in elem.attrib.items():
+                if k.endswith("}Key") or k == "Key" or k.endswith(":Key"):
+                    xkey = v
+                    break
+            parts = [tag]
+            if display:
+                parts.append(display)
+            if xkey:
+                parts.append(f"Key={xkey}")
+            label = f"{':'.join(parts)}#{len(scope_ids)}"
+        scope_ids[key] = label
+        return label
+
     variables: list[VariableSummary] = []
 
     for elem in root.iter():
@@ -133,28 +196,28 @@ def _extract_variables(root: ET.Element) -> list[VariableSummary]:
         owner = parent_map.get(prop_parent) if prop_parent is not None else None
 
         scope = ""
+        scope_path: list[str] = []
         if owner is not None:
-            owner_key = id(owner)
-            if owner_key not in owner_ids:
-                # Prefer the owner's IdRef if present; else build a stable
-                # label from tag + DisplayName + a sequence counter.
-                ref_val = ""
-                for k, v in owner.attrib.items():
-                    if k.endswith("}IdRef") or k.endswith(":IdRef") or k == "IdRef":
-                        ref_val = v
-                        break
-                if ref_val:
-                    owner_ids[owner_key] = ref_val
-                else:
-                    owner_tag = _local_name(owner.tag)
-                    display = owner.attrib.get("DisplayName", "")
-                    label = f"{owner_tag}:{display}" if display else owner_tag
-                    owner_ids[owner_key] = f"{label}#{len(owner_ids)}"
-            scope = owner_ids[owner_key]
+            # Build ancestor chain from document root down to (and including)
+            # the owning activity. We skip property-element wrappers
+            # (e.g. <Sequence.Variables>) because they aren't real scopes.
+            chain: list[ET.Element] = []
+            cur: ET.Element | None = owner
+            while cur is not None:
+                tag = _local_name(cur.tag)
+                if "." not in tag:  # skip property elements
+                    chain.append(cur)
+                cur = parent_map.get(cur)
+            chain.reverse()  # root -> owner
+            scope_path = [_scope_id_for(e) for e in chain]
+            scope = scope_path[-1] if scope_path else ""
         elif prop_parent is not None:
             scope = _local_name(prop_parent.tag)
+            scope_path = [scope]
 
-        variables.append(VariableSummary(name=name, type=type_arg, scope=scope))
+        variables.append(VariableSummary(
+            name=name, type=type_arg, scope=scope, scope_path=scope_path,
+        ))
     return variables
 
 
@@ -266,6 +329,8 @@ def _count_activity_children(elem: ET.Element) -> int:
     """Count direct child elements that are activities (not meta/property elements)."""
     count = 0
     for child in elem:
+        if _is_non_activity_ns(child.tag):
+            continue
         local = _local_name(child.tag)
         if local in _META_ELEMENTS:
             continue
@@ -331,12 +396,25 @@ def _extract_catch_blocks(root: ET.Element) -> list[CatchBlockSummary]:
 
 
 def _scan_expressions(xml_content: str) -> tuple[list[str], list[str]]:
-    """Scan all [...] bracket expressions in the XAML content.
+    """Scan every VB expression in the XAML content.
+
+    UiPath stores VB expressions in two places:
+      * inside `[...]` brackets in text nodes and attribute values,
+      * as the content of `ExpressionText="..."` attributes on
+        <mva:VisualBasicValue> / <mva:VisualBasicReference> elements.
+
+    Missing the second form made variables referenced only via Import
+    Arguments of InvokeWorkflowFile look unused — GEN-001 then deleted the
+    declaration while ST-NMG-001 still renamed the references, orphaning
+    them and triggering BC30451 "variable not declared" downstream.
 
     Returns (all_expression_strings, referenced_identifiers).
     """
-    # Find all bracket expressions like [variable1], [CInt(var)], [var.ToString()]
+    # 1. [...] bracket expressions in text nodes and attribute values.
     expressions = re.findall(r'\[([^\[\]]+)\]', xml_content)
+    # 2. ExpressionText attribute values — treated the same as the interior
+    #    of a bracket expression.
+    expressions.extend(re.findall(r'\bExpressionText="([^"]*)"', xml_content))
 
     # Extract identifiers from expressions (word characters that could be variable/argument names)
     identifiers: set[str] = set()
@@ -344,26 +422,32 @@ def _scan_expressions(xml_content: str) -> tuple[list[str], list[str]]:
         # Skip XML-like content and pure strings
         if expr.startswith("<") or expr.startswith("&") or expr.startswith('"'):
             continue
-        # Extract all word tokens that look like variable/argument names
+        # Extract all word tokens that look like variable/argument names.
+        # Only filter real VB language keywords — method/property names like
+        # "message", "value", "key", "item", etc. are legitimate user
+        # variable names in many UiPath projects. Filtering them caused
+        # declared-and-used variables to appear unused, which made GEN-001
+        # delete the declaration while ST-NMG-001 still renamed the
+        # references — leaving the output with `str_Message` everywhere and
+        # no declaration (BC30451 "not declared" avalanche). Non-variable
+        # tokens get filtered out naturally by the intersection with
+        # var_names / arg_names downstream.
         tokens = re.findall(r'\b([a-zA-Z_]\w*)\b', expr)
         for token in tokens:
-            # Skip common VB.NET keywords and types
             if token.lower() in {
-                "true", "false", "nothing", "new", "not", "and", "or",
-                "if", "then", "else", "end", "dim", "as", "string",
-                "integer", "int32", "int64", "boolean", "double", "decimal",
-                "object", "byte", "char", "date", "datetime", "timespan",
-                "datatable", "datarow", "cint", "cstr", "cdbl", "ctype",
+                # Pure VB keywords / operators
+                "true", "false", "nothing", "new", "not", "and", "or", "andalso", "orelse",
+                "if", "then", "else", "elseif", "end", "dim", "as", "is", "isnot",
+                "select", "case", "when", "function", "sub", "return",
+                "for", "each", "while", "do", "loop", "until", "next", "step",
+                "to", "in", "of", "with", "me", "mybase", "myclass", "byref", "byval",
                 "typeof", "gettype", "directcast", "trycast",
-                "tostring", "tolower", "toupper", "trim", "split",
-                "contains", "replace", "substring", "length", "count",
-                "rows", "columns", "value", "text", "name", "key",
-                "add", "remove", "clear", "item", "index",
-                "now", "today", "format", "parse", "tryparse",
-                "environment", "path", "system", "io", "math",
-                "convert", "array", "list", "dictionary",
-                "exception", "message", "stacktrace", "innerexception",
-                "fromminutes", "fromseconds", "frommilliseconds",
+                # Primitive type names
+                "string", "integer", "int32", "int64", "boolean", "double", "decimal",
+                "object", "byte", "char", "date", "datetime", "timespan", "single",
+                # VB conversion functions
+                "cint", "cstr", "cdbl", "ctype", "cbool", "cchar", "cdate", "clng",
+                "cobj", "csng", "cbyte", "cshort",
             }:
                 continue
             identifiers.add(token)
@@ -419,6 +503,8 @@ def parse_xaml_file(
     activity_summaries: list[ActivitySummary] = []
 
     for elem in root.iter():
+        if _is_non_activity_ns(elem.tag):
+            continue
         local = _local_name(elem.tag)
         if local in _META_ELEMENTS:
             continue

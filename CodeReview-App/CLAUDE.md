@@ -115,7 +115,7 @@ frontend/src/
 
 Note: Source Excel has 41 rows (some rules appear in multiple categories), plus ST-NMG-010 (PascalCase enforcement) and ST-NMG-020 (Default Studio Display Name) added locally — 38 unique rule IDs.
 
-## Auto-Fix Rules (17 Rules)
+## Auto-Fix Rules (18 Rules)
 
 Text-level operations on raw XAML — regex rename, positional attribute-value rewrite, element removal, or contained-insertion inside `<Catch>` delegate bodies. Never inserts elements with attributes into property-element contexts (which corrupts UiPath's WPF XAML parser).
 
@@ -136,7 +136,8 @@ Text-level operations on raw XAML — regex rename, positional attribute-value r
 | ST-DBP-003 | Insert `<ui:LogMessage Level="Error">` inside the empty Catch body Sequence (includes exception type, message, source). Auto-injects `xmlns:ui` on the Activity root when not already declared | ET-guided discovery + positional regex insertion before `</Sequence>` |
 | ST-DBP-023 | Delete empty workflow file on accept | File deletion via `delete` flag (fix response) + `os.remove()` in `/api/fix/accept` |
 | GEN-001 | Remove unused `<Variable/>` declarations | Element removal |
-| GEN-003 / GEN-REL-001 | Remove empty Sequence elements — both self-closing `<Sequence/>` and open-tag `<Sequence>[metadata-only]</Sequence>` (by flagged DisplayName). Structural Catch-body Sequences are excluded (ST-DBP-003 handles those). | Element removal with metadata-only verification |
+| GEN-003 / GEN-REL-001 | Remove empty Sequence elements — both self-closing `<Sequence/>` and open-tag `<Sequence>[metadata-only]</Sequence>` (by flagged DisplayName). Structural Catch-body Sequences are excluded (ST-DBP-003 handles those). Also handles no-DisplayName empty Sequences (matched by IdRef) when `Sequence` itself is in the flagged set | Element removal with metadata-only verification |
+| ST-NMG-005-SIBLINGS | Disambiguate sibling-scope variables sharing the same name by suffixing with a bare digit (`dt_FoldersData2`, `dt_FoldersData3`, ...). Only renames within the owner activity's text span via `_find_owner_text_span` (anchored on `WorkflowViewState.IdRef`) so cross-scope references stay intact. UiPath ST-NMG-005 flags any cross-scope name reuse as "Variable Overrides Variable" — our static reviewer is more conservative and only flags ancestor shadows, so this rule has no corresponding finding and runs as a post-convergence pass on every file. Skips true ancestor shadows (already removed by ST-NMG-005). After this pass runs, `_fix_gen_001` re-runs to clean up declarations that were previously hidden as "used" by the flat reviewer but are now provably orphaned (e.g. `dt_AssetsData8` with no in-scope expression refs) | ET-guided owner discovery + scope-bounded `_rename_in_xaml` |
 
 After auto-fix, findings for fixed rules get `status = "Fixed"` in the review grid.
 
@@ -164,8 +165,33 @@ Both rules can apply to the same activity (e.g., 3 Assigns all named "Assign" �
 6. **Priority 5** — Default-name rewrite: ST-NMG-020 — runs LAST in the NMG tier so its descriptors (which pull from `<Assign.To>`, `Message`, etc.) reference the final post-rename variable/argument names
 7. **Priority 6** — Remaining NMG rules (e.g. ST-NMG-004)
 8. **Priority 7-8** — UI Automation / Performance / Reliability / General
+9. **Post-convergence (after the loop terminates)**: `_fix_st_nmg_005_siblings` disambiguates sibling-scope variable duplicates (no corresponding finding — runs unconditionally on the converged content), then `_fix_gen_001` re-runs against a fresh re-review to remove any orphan declarations that disambiguation surfaced
 
 Example: if ST-NMG-002 ran before ST-NMG-012, renaming `Name="test"` to `Name="in_test"` would happen first, but the attribute-form default `this:Main.test="value"` would still reference the old name. ST-NMG-012 removes the default attribute first so the subsequent rename applies cleanly.
+
+### Collision guards on rename rules
+
+ST-NMG-001/002/009/011 (prefix-add) and ST-NMG-008/016 (length-shorten) all consult `_collect_declared_names(content)` before applying a rename. If the candidate `new_name` is already declared as a variable or argument anywhere in the file, the rule **skips** the rename and surfaces a `SKIPPED` line in the change log instead of corrupting the workflow. Scenarios this protects against:
+
+- **Pre-existing duplicate**: file has both `URLCredentialTarget` and `str_URLCredentialTarget`. Without the guard, ST-NMG-001 would rename the first to `str_URLCredentialTarget`, producing two declarations with the same name and UiPath rejecting the file with "A variable, RuntimeArgument or DelegateArgument already exists with the name 'X'. Names must be unique within an environment scope." With the guard the second is left at its original name and a SKIPPED log entry surfaces.
+- **Shorten-into-collision**: `_shorten_name`'s middle-word-drop algorithm can map distinct originals to the same shortened name (e.g. `URLSpecificCredentialTarget` and `URLTenantSpecificCredentialTarget` both → `URLCredentialTarget`; `in_FolderMigrationTemplateFilePath` and `in_FolderMigrationWorkbookFilePath` both → `in_FolderMigrationFilePath`). ST-NMG-008/016 pre-compute every proposal and group by target — any group with 2+ originals is skipped to keep the names distinct.
+
+`fix_xaml` propagates SKIPPED messages even when a handler returns `modified=False` (so the user sees why a finding wasn't auto-fixed) and dedupes the final change log to avoid repeats from convergence-loop reflagging.
+
+### `_rename_in_xaml` covers four reference forms
+
+Every rename uses `_rename_in_xaml` to update declarations + every reference. The scanner handles:
+
+1. **Variable/Argument declarations**: `Name="oldName"`
+2. **InvokeWorkflowFile keys**: `Key="oldName"`
+3. **VB-expression references** in four shapes:
+   - **3a**: simple bracket interiors `[oldName + 1]` — every occurrence in the bracket, not just the first
+   - **3b**: `ExpressionText="..."` attribute values on `<mva:VisualBasicValue>` / `<mva:VisualBasicReference>`
+   - **3c**: attribute-value VB expressions whose body contains inner brackets — e.g. `Condition="[X.StartsWith(&quot;[&quot;)]"`. The simple bracket walker in (3a) skips these because `\[([^\[\]]+)\]` can't match expressions with internal `[` / `]`. Without this pattern, the declaration was renamed but the reference stayed at the old name, producing UiPath BC30451 "X is not declared".
+   - **3d**: element-text VB expressions with inner brackets — e.g. `<InArgument>[String.Format("//*[{0}]", X.Select(...))]</InArgument>`. Same root cause as (3c), but in element text instead of an attribute value.
+4. **Attribute-form root references**: `this:Main.oldName="value"` on the Activity root
+
+The lookbehind `(?<![\w.])` on the word regex prevents (a) double-renaming when the simple bracket walker has already done the work and (b) crossing `.` so `credential.Password` stays intact even when an argument `Password` is being renamed.
 
 ### Convergence loop — rules cascade until stable
 
@@ -183,10 +209,14 @@ Both modes aim for byte-identical output on the same input across runs:
 Verified: 3 consecutive identical static reviews produce the same finding hash; 3 consecutive fixes produce byte-identical XAML output.
 
 ### Rule scoping notes
-- **GEN-REL-001 Empty Sequences** only flags standalone user-authored Sequences. Sequences that are direct children of `<ActivityAction>` (catch handler bodies) are marked `is_structural_wrapper` by the parser and skipped — they're covered by ST-DBP-003. Sequences inside `TryCatch.Try` and `TryCatch.Finally` *are* flagged (no other rule covers them).
+- **GEN-REL-001 Empty Sequences** only flags standalone user-authored Sequences. Sequences that are direct children of `<ActivityAction>` (catch handler bodies) are marked `is_structural_wrapper` by the parser and skipped — they're covered by ST-DBP-003. Sequences inside `TryCatch.Try` and `TryCatch.Finally` *are* flagged (no other rule covers them). The fixer also handles no-DisplayName empty Sequences (matched by IdRef) — without that fallback, `<Sequence sap2010:WorkflowViewState.IdRef="Sequence_46">` style empty blocks would be flagged but never removed because the matcher required a `DisplayName=` substring.
 - **ST-DBP-003 Empty Catch** discovery uses the full `_META_ELEMENTS` set (including XAML primitives like `x:Boolean`, `x:String`) so metadata inside ViewState Dictionaries isn't miscounted as activity content.
 - **Variable scope** tracking uses the owning Sequence's `WorkflowViewState.IdRef` (or DisplayName + owner-counter fallback), not just the property-element wrapper name. This gives each Sequence's variables a distinct scope so ST-NMG-005 shadow detection actually fires.
 - **Argument defaults** are detected in both element-form (`<this:Main.argName>...</this:Main.argName>`) and attribute-form (`this:Main.argName="..."` on the Activity root). `_rename_in_xaml` also updates attribute-form references when renaming so `this:Main.oldName="value"` becomes `this:Main.newName="value"` and UiPath Studio doesn't error with "The property (oldName) is either invalid or not defined".
+- **`_body_is_pascal_case`** uses wordninja to distinguish a single long English word (e.g. `Description`, `Authentication`, `Configuration` — valid PascalCase, no internal boundary) from concatenated soup (`Filtercandidatedetailsfromsaptabledata` — needs splitting). The earlier strict heuristic ("long body without internal uppercase/digit = bad") false-flagged real single words.
+- **ST-NMG-020 Default Studio Display Name** excludes statement-like activities whose type IS the meaningful name (`Break`, `Continue`, `Rethrow`, `Throw`, `ActivityFunc`, `ActivityAction`, `Pick`, `PickBranch`, `TerminateWorkflow`). Renaming `Break` to a synthetic descriptor adds noise without information.
+- **ST-NMG-004 Display Name Duplication** reviewer's `generic_names` set is aligned with the fixer's `_GENERIC_DISPLAY_NAMES` (Sequence, Flowchart, FlowDecision, FlowStep, **Body, TryCatch, Try, Catch, Finally**) so the reviewer doesn't flag duplicates the fixer would deliberately leave alone as scaffolding.
+- **Sibling-scope variable disambiguation** uses a numeric suffix without underscore (`X2`, `X3`) rather than `X_2` so the body remains valid PascalCase (an underscore in the body would re-trigger ST-NMG-010). Scope-bounded rename is anchored on `WorkflowViewState.IdRef` via `_find_owner_text_span`; the open-tag regex uses `(?=[\s/>])` lookahead instead of `\b` to avoid false-positive matches on property elements like `<Sequence.Variables>` (which would corrupt depth-counting because their closes `</Sequence.Variables>` don't match the close regex).
 
 ## Code Conventions
 
