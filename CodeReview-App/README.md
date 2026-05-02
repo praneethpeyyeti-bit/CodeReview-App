@@ -110,7 +110,7 @@ on purpose, so every new clone has to authenticate once.
 7. **Accept & save** — Click "Browse..." to pick a destination folder via the native picker (Chrome/Edge) — files write directly via the File System Access API. Fall back to typing a server-side path if FSA isn't available. Original ZIP folder structure is preserved either way.
 8. **Export** — Download findings as an Excel report
 
-See [USAGE.md](USAGE.md) for a step-by-step walkthrough with screenshots of every screen, plus troubleshooting tips.
+See [USAGE.pdf](USAGE.pdf) for a step-by-step walkthrough of every screen, plus troubleshooting tips.
 
 ## Review Modes
 
