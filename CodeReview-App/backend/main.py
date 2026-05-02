@@ -36,7 +36,7 @@ from services.llm_reviewer import (
 # instant, no UiPath auth, no agent units. AI mode is opt-in per request.
 DEFAULT_MODE = "static"
 from services.token_refresh import token_refresh_loop, refresh_once, _seconds_until_expiry, _read_auth_json
-from services.xaml_fixer import fix_xaml
+from services.xaml_fixer import fix_xaml, reconcile_invoke_workflow_keys
 from services.static_reviewer import review_static
 
 logging.basicConfig(level=logging.INFO)
@@ -465,24 +465,16 @@ async def apply_fixes(request: Request):
     if not xaml_contents:
         raise HTTPException(status_code=400, detail="No .xaml files found.")
 
-    # Apply fixes per file
+    # Apply fixes per file. Always call fix_xaml — even when a file has no
+    # rule-driven findings, the self-heal cleanup pass inside fix_xaml strips
+    # bad DisplayName attributes that an earlier buggy run may have injected
+    # into typed UI sub-components (uix:TargetApp, TargetAnchorable, etc.).
     fix_results = []
     for item in xaml_contents:
         file_findings = [
             f for f in parsed_findings
             if f.file_name == item["file_name"]
         ]
-        if not file_findings:
-            fix_results.append({
-                "file_name": item["file_name"],
-                "zip_entry_path": item.get("zip_entry_path", ""),
-                "original_content": item["content"],
-                "modified_content": item["content"],
-                "changes": [],
-                "delete": False,
-            })
-            continue
-
         result = fix_xaml(item["content"], file_findings)
         fix_results.append({
             "file_name": item["file_name"],
@@ -492,6 +484,17 @@ async def apply_fixes(request: Request):
             "changes": result["changes_applied"],
             "delete": result.get("delete", False),
         })
+
+    # Project-wide reconciliation pass: argument renames inside callee
+    # workflows can leave InvokeWorkflowFile callers in OTHER files binding
+    # the OLD x:Key. UiPath rejects those with "argument doesn't exist on
+    # the called workflow". This sweeps all files post-fix and rewrites
+    # caller keys to match the renamed arg names.
+    reconciled = reconcile_invoke_workflow_keys(fix_results)
+    if reconciled:
+        total_keys = sum(len(v) for v in reconciled.values())
+        logger.info("Reconciled %d InvokeWorkflowFile arg key(s) across %d caller file(s)",
+                    total_keys, len(reconciled))
 
     # Collect rule IDs that were actually fixed (had changes applied)
     fixed_rule_ids: set[str] = set()
@@ -631,3 +634,25 @@ async def accept_fixes(request: Request):
         "deleted_count": deleted,
         "passthrough_count": passthrough_count,
     }
+
+
+@app.get("/api/fix/passthrough/{fix_id}")
+async def get_passthrough(fix_id: str):
+    """Return the cached non-XAML passthrough files for client-side writes.
+
+    Used by the Browse-folder flow in the diff viewer when the browser holds
+    a FileSystemDirectoryHandle and writes files directly without going
+    through `/api/fix/accept`. Returns base64-encoded bytes — JSON-safe and
+    avoids tying the response to a specific multipart shape.
+    """
+    import base64
+    entry = _fix_passthrough.get(fix_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="No passthrough cache for this fix_id")
+    files = []
+    for f in entry.get("other_files", []):
+        files.append({
+            "zip_entry_path": f.get("zip_entry_path", ""),
+            "content_base64": base64.b64encode(f.get("content_bytes", b"")).decode("ascii"),
+        })
+    return {"files": files}

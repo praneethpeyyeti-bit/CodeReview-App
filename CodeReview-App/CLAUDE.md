@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Full-stack code review tool for UiPath RPA XAML workflows. **Static analysis is the default** — deterministic, instant, zero auth, zero agent units. **AI-Powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer) is opt-in per request. Both modes cover the same 38 unique Workflow Analyzer rules across 7 categories; auto-fix handles 17 rules (including file-level deletion of empty workflows and renaming activities still using Studio default names).
+Full-stack code review tool for UiPath RPA XAML workflows. **Static analysis is the default** — deterministic, instant, zero auth, zero agent units. **AI-Powered review** (Claude, GPT-4, Gemini via UiPath AI Trust Layer) is opt-in per request. Both modes cover the same 38 unique Workflow Analyzer rules across 7 categories; auto-fix handles 18 rules (including file-level deletion of empty workflows, activity rename with content-derived descriptors, and a project-wide reconciliation pass that rewrites InvokeWorkflowFile caller keys after callee argument renames).
 
 ## Architecture
 
@@ -48,7 +48,7 @@ backend/
     static_reviewer.py     # Static analysis engine (37 rule checker functions, no LLM)
     llm_reviewer.py        # LLM invocation, batching, JSON parsing
     xaml_parser.py          # XAML XML parsing -> ReviewContext (properties, selectors, catch blocks, expressions)
-    xaml_fixer.py           # Auto-fix engine (15 rules: naming, duplicate DisplayName, shadows, length, defaults, empty catch, empty sequences, unused vars/args)
+    xaml_fixer.py           # Auto-fix engine: 18 rules + cross-file InvokeWorkflowFile reconciliation + DisplayName cleanup pass for typed UI sub-components
     zip_extractor.py        # ZIP file extraction
     token_refresh.py        # Background OAuth token refresh
   .env                     # UiPath tokens & config (auto-managed)
@@ -64,7 +64,7 @@ frontend/src/
     UploadZone.tsx         # File upload + static/AI toggle + model selection
     ReviewGrid.tsx         # AG Grid findings table
     SummaryPanel.tsx       # Severity bars, metric cards, category filters
-    DiffViewer.tsx         # Side-by-side diff viewer
+    DiffViewer.tsx         # Side-by-side diff viewer + Browse-folder save (FSA API)
     ExportButton.tsx       # Excel export trigger
     RulesCatalogModal.tsx  # Rule reference modal
   models/finding.ts        # TypeScript interfaces
@@ -82,7 +82,8 @@ frontend/src/
 | `/api/review` | POST | Submit review (sync for static, async for LLM) |
 | `/api/review/{job_id}` | GET | Poll LLM review job status/results |
 | `/api/fix` | POST | Apply auto-fixes, returns `fixed_rule_ids` |
-| `/api/fix/accept` | POST | Save fixed files preserving ZIP folder structure |
+| `/api/fix/accept` | POST | Save fixed files preserving ZIP folder structure (server-side) |
+| `/api/fix/passthrough/{fix_id}` | GET | Return base64-encoded non-XAML files for client-side write via the File System Access API (used by the Browse-folder save flow in the diff viewer) |
 | `/api/refresh-token` | POST | Manual OAuth token refresh |
 
 ## Two Review Modes
@@ -123,7 +124,7 @@ Text-level operations on raw XAML — regex rename, positional attribute-value r
 |------|-----|--------|
 | ST-NMG-001 | Add type prefix to variables (`str_`, `int_`, `dt_`, `bln_`, `dtm_`, `ts_`, `arr_`, `dic_`) | Regex rename across all XAML locations |
 | ST-NMG-002 | Add direction prefix to arguments (`in_`, `out_`, `io_`) | Regex rename across all XAML locations |
-| ST-NMG-004 | Rename duplicate DisplayNames using selector-derived labels (e.g. `Click 'Save'`); counter fallback | Positional regex on the Nth `DisplayName="..."` occurrence |
+| ST-NMG-004 | Rename duplicate DisplayNames using selector-derived labels (e.g. `Click 'Save'`). Skips typed UI sub-components (`uix:Target`, `TargetApp`, `TargetAnchorable`, `VerifyExecution*`) — those reject `DisplayName` injection | Positional regex on the Nth `DisplayName="..."` occurrence |
 | ST-NMG-005 | Keep the outermost Variable, remove inner-scope shadow declarations | Remove all `<Variable Name="X"/>` occurrences except the first |
 | ST-NMG-006 | Remove variable that collides with an argument name; retain the argument | Remove `<Variable Name="X"/>` |
 | ST-NMG-008 | Shorten variable name > 30 chars (preserve prefix, drop middle camelCase words) | Regex rename |
@@ -132,12 +133,14 @@ Text-level operations on raw XAML — regex rename, positional attribute-value r
 | ST-NMG-011 | Add direction prefix (`in_`/`out_`/`io_`) to DataTable arguments | Regex rename |
 | ST-NMG-012 | Remove default-value for **In** arguments (Out/InOut are ignored since they can't have defaults). Handles both element-form `<this:WfName.argName>...</...>` and attribute-form `this:WfName.argName="..."` on the Activity root | Element removal + attribute stripping |
 | ST-NMG-016 | Shorten argument name > 30 chars | Regex rename |
-| ST-NMG-020 | Rename activities still using the Studio default DisplayName (missing or equals type name). UI activities use selector content; non-UI use type-specific descriptors (Assign target variable, LogMessage text, InvokeWorkflowFile filename, Delay duration, If/While condition, etc.). Activities with no derivable descriptor are skipped. Runs LAST in the NMG tier so descriptors reflect the final post-rename, post-shorten variable/argument names | ET-guided discovery + positional regex (insert if no DisplayName, replace if DisplayName=type) |
+| ST-NMG-020 | Rename activities still using the Studio default DisplayName (missing or equals type name). Descriptor extractors: UI selectors (Click/TypeInto/etc), `Assign`/`AssignOperation` target variable, `LogMessage`/`Log` message text, `WriteLine`/`Comment` Text, `InvokeWorkflowFile` filename, `Delay`/`NDelay` duration, `If`/`While`/`DoWhile`/`FlowDecision` condition (attr or `<X.Condition>` property element), `ForEach`/`ForEachRow` Values, `Switch`/`FlowSwitch` Expression, `Throw`/`Rethrow` Exception expression, `Sequence`/`NSequence`/`TryCatch`/`Flowchart`/`FlowStep` recurse into first inner activity, then a generic attribute fallback (`Text`, `Url`, `FileName`, `Caption`, `ProcessName`, `KeysList`, …). **No counter fallback** — activities with no derivable meaning (`Break`, an empty `Sequence`) are left untouched rather than getting an information-free `Activity (1)` rename. Runs LAST in the NMG tier so descriptors reflect the final post-rename, post-shorten variable/argument names | ET-guided discovery + positional regex (insert if no DisplayName, replace if DisplayName=type) |
 | ST-DBP-003 | Insert `<ui:LogMessage Level="Error">` inside the empty Catch body Sequence (includes exception type, message, source). Auto-injects `xmlns:ui` on the Activity root when not already declared | ET-guided discovery + positional regex insertion before `</Sequence>` |
 | ST-DBP-023 | Delete empty workflow file on accept | File deletion via `delete` flag (fix response) + `os.remove()` in `/api/fix/accept` |
 | GEN-001 | Remove unused `<Variable/>` declarations | Element removal |
 | GEN-003 / GEN-REL-001 | Remove empty Sequence elements — both self-closing `<Sequence/>` and open-tag `<Sequence>[metadata-only]</Sequence>` (by flagged DisplayName). Structural Catch-body Sequences are excluded (ST-DBP-003 handles those). Also handles no-DisplayName empty Sequences (matched by IdRef) when `Sequence` itself is in the flagged set | Element removal with metadata-only verification |
 | ST-NMG-005-SIBLINGS | Disambiguate sibling-scope variables sharing the same name by suffixing with a bare digit (`dt_FoldersData2`, `dt_FoldersData3`, ...). Only renames within the owner activity's text span via `_find_owner_text_span` (anchored on `WorkflowViewState.IdRef`) so cross-scope references stay intact. UiPath ST-NMG-005 flags any cross-scope name reuse as "Variable Overrides Variable" — our static reviewer is more conservative and only flags ancestor shadows, so this rule has no corresponding finding and runs as a post-convergence pass on every file. Skips true ancestor shadows (already removed by ST-NMG-005). After this pass runs, `_fix_gen_001` re-runs to clean up declarations that were previously hidden as "used" by the flat reviewer but are now provably orphaned (e.g. `dt_AssetsData8` with no in-scope expression refs) | ET-guided owner discovery + scope-bounded `_rename_in_xaml` |
+| **DisplayName cleanup pass** | Strip `DisplayName="..."` attributes from typed UI sub-components that REJECT them (`uix:Target`, `TargetApp`, `TargetAnchorable`, `TargetRegion`, `TargetImage`, `VerifyExecutionOptions`, `VerifyExecutionTypeIntoOptions`, `VerifyExecutionClickOptions`, `VerifyExecutionGetTextOptions`, `InputOptions`, `OutputOptions`, `ScreenshotOptions`). Without this, Studio fails to load with `Could not find member 'DisplayName' in type 'uix:TargetX'`. Runs at the START of every `fix_xaml` call, even when no findings exist for the file — so projects corrupted by an older buggy version of ST-NMG-020 self-heal on the next Auto-Fix | Regex-based attribute strip (`_strip_invalid_displaynames`) |
+| **InvokeWorkflowFile cross-file reconciliation** | After all per-file fixes settle, sweep every workflow's `<ui:InvokeWorkflowFile.Arguments>` blocks and rewrite each `x:Key="oldKey"` to match the renamed argument in the called workflow. Argument renames inside a callee (ST-NMG-002 prefix add, ST-NMG-010 PascalCase, ST-NMG-016 length-shorten) leave callers in OTHER files binding to the OLD key — UiPath rejects those at runtime with "argument doesn't exist on the called workflow". The reconciler resolves the callee path by suffix-matching the `WorkflowFileName` against known zip paths, then matches old-vs-new keys via case-insensitive equality, prefix-prepend, and PascalCase reconstruction. Edits are appended to the caller's change log as `ST-NMG-002: Reconciled InvokeWorkflowFile arg key 'old' -> 'new'` | Project-wide post-pass (`reconcile_invoke_workflow_keys`), called from `/api/fix` after the per-file fix loop |
 
 After auto-fix, findings for fixed rules get `status = "Fixed"` in the review grid.
 
@@ -214,19 +217,34 @@ Verified: 3 consecutive identical static reviews produce the same finding hash; 
 - **Variable scope** tracking uses the owning Sequence's `WorkflowViewState.IdRef` (or DisplayName + owner-counter fallback), not just the property-element wrapper name. This gives each Sequence's variables a distinct scope so ST-NMG-005 shadow detection actually fires.
 - **Argument defaults** are detected in both element-form (`<this:Main.argName>...</this:Main.argName>`) and attribute-form (`this:Main.argName="..."` on the Activity root). `_rename_in_xaml` also updates attribute-form references when renaming so `this:Main.oldName="value"` becomes `this:Main.newName="value"` and UiPath Studio doesn't error with "The property (oldName) is either invalid or not defined".
 - **`_body_is_pascal_case`** uses wordninja to distinguish a single long English word (e.g. `Description`, `Authentication`, `Configuration` — valid PascalCase, no internal boundary) from concatenated soup (`Filtercandidatedetailsfromsaptabledata` — needs splitting). The earlier strict heuristic ("long body without internal uppercase/digit = bad") false-flagged real single words.
-- **ST-NMG-020 Default Studio Display Name** excludes statement-like activities whose type IS the meaningful name (`Break`, `Continue`, `Rethrow`, `Throw`, `ActivityFunc`, `ActivityAction`, `Pick`, `PickBranch`, `TerminateWorkflow`). Renaming `Break` to a synthetic descriptor adds noise without information.
-- **ST-NMG-004 Display Name Duplication** reviewer's `generic_names` set is aligned with the fixer's `_GENERIC_DISPLAY_NAMES` (Sequence, Flowchart, FlowDecision, FlowStep, **Body, TryCatch, Try, Catch, Finally**) so the reviewer doesn't flag duplicates the fixer would deliberately leave alone as scaffolding.
+- **ST-NMG-020 Default Studio Display Name** structural-skip set (`_NMG020_STRUCTURAL`) excludes only types that genuinely can't accept a `DisplayName`: workflow roots (`Activity`, `StateMachine`), delegate wrappers (`ActivityFunc`, `ActivityAction`), property-element shells (`Body`, `Try`, `Catch`, `Finally`), and typed UI sub-components (`Target`, `TargetApp`, `TargetAnchorable`, `TargetRegion`, `TargetImage`, `VerifyExecution*`, `InputOptions`, `OutputOptions`, `ScreenshotOptions`). **Containers** (`Sequence`, `NSequence`, `TryCatch`, `Flowchart`, `FlowStep`) ARE renamed — the descriptor extractor recurses into the first meaningful inner activity, so a Sequence wrapping `Click 'Save'` becomes `Sequence 'Click Save'`. **No counter fallback** — activities for which no descriptor can be derived (bare `Break`/`Continue`/`Rethrow`, an empty `Sequence`) are left at the Studio default rather than being renamed `Break (1)`, which would add no information.
+- **ST-NMG-004 Display Name Duplication** reviewer's `generic_names` set covers structural scaffolding (Sequence, Flowchart, FlowDecision, FlowStep, Body, TryCatch, Try, Catch, Finally) AND typed UI sub-components (Target, TargetApp, TargetAnchorable, TargetRegion, TargetImage, VerifyExecutionOptions, VerifyExecutionTypeIntoOptions, VerifyExecutionClickOptions, VerifyExecutionGetTextOptions, InputOptions, OutputOptions, ScreenshotOptions) — so the reviewer doesn't flag duplicates the fixer would deliberately leave alone OR cannot fix without corrupting the file. The fixer's local `skip_tags` is unioned with `_TYPED_NO_DISPLAYNAME_TAGS` so even if a finding does slip through, the rule won't inject `DisplayName` into a typed component.
+- **Activity descriptor expansions**: `_extract_activity_descriptor` now handles `Assign`/`AssignOperation` (target variable from `<X.To>`), `Comment` (Text attribute, with leading `// ` stripped), `Throw`/`Rethrow` (Exception expression from attribute or `<X.Exception>` property element), property-element-form Conditions/Values/Expressions for `If`/`While`/`DoWhile`/`FlowDecision`/`ForEach`/`ForEachRow`/`Switch`/`FlowSwitch`, and a generic attribute fallback (`_generic_attribute_descriptor`) that scans common labelling attributes (`Text`, `Caption`, `Title`, `Url`, `FileName`, `Path`, `ProcessName`, `KeysList`, `MailFolder`, …) plus property-element children matching the same names — so activities like `MessageBox`/`OpenBrowser`/`SendHotkey`/`KillProcess`/`ReadTextFile` get sensible names without explicit per-type code.
 - **Sibling-scope variable disambiguation** uses a numeric suffix without underscore (`X2`, `X3`) rather than `X_2` so the body remains valid PascalCase (an underscore in the body would re-trigger ST-NMG-010). Scope-bounded rename is anchored on `WorkflowViewState.IdRef` via `_find_owner_text_span`; the open-tag regex uses `(?=[\s/>])` lookahead instead of `\b` to avoid false-positive matches on property elements like `<Sequence.Variables>` (which would corrupt depth-counting because their closes `</Sequence.Variables>` don't match the close regex).
+
+## Browse-folder save (client-side write via FSA)
+
+The diff viewer's "Accept All & Save" flow has two paths:
+
+1. **Browse-folder (Chrome / Edge)** — clicking "Browse..." opens the native folder picker via `window.showDirectoryPicker({mode: 'readwrite'})`. The frontend then writes XAMLs and non-XAML project assets DIRECTLY to the picked folder using the File System Access API. Non-XAML files (assets, .cs, project.json, screenshots) are fetched from the new `/api/fix/passthrough/{fix_id}` endpoint as base64 and written as bytes. Bypasses `/api/fix/accept` entirely.
+2. **Backend POST fallback** — typing a server-side path or running on a browser without FSA support sends the request through `/api/fix/accept` which writes files server-side.
+
+Implementation notes ([DiffViewer.tsx](frontend/src/components/DiffViewer.tsx)):
+- **Path sanitization** (`splitRelativePath`, `isValidFsaSegment`) rejects directory entries (trailing `/`), names containing `< > : " | ? *` or control chars, names with trailing dot/space, Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`), and `.`/`..` segments. Bad entries are skipped, not aborting the save.
+- **Per-entry try/catch** so one bad path produces a "X failed: <path>: <reason>" message in the error banner instead of stopping the whole save.
+- **Bounded parallel writes** (`runWithConcurrency` with limit 6) — FSA serializes per-file but pipelining cuts wall time noticeably on projects with many small files.
+- **Live progress counter** in the Save button: `Saving 17/47...` instead of a static spinner.
 
 ## Code Conventions
 
 - Backend uses Python type hints and Pydantic models
 - Frontend uses TypeScript strict mode with Tailwind CSS
-- XAML fixes must operate on raw text (positional regex or string replacement) — never re-serialize via ET.tostring (drops xmlns). Never insert elements into property-element contexts.
+- XAML fixes must operate on raw text (positional regex or string replacement) — never re-serialize via ET.tostring (drops xmlns). Never insert elements into property-element contexts (which corrupts UiPath's WPF XAML parser) and never inject `DisplayName` into typed UI sub-components in `_TYPED_NO_DISPLAYNAME_TAGS` (which produces "Could not find member 'DisplayName' in type 'uix:TargetX'" load errors).
 - Fixed files preserve the original ZIP folder structure (no `modified/` subfolder)
 - Static analysis returns `ReviewResponse` directly; LLM returns `job_id` for polling
 - Token refresh runs automatically in background
 - Upload zone uses toggle buttons for Static/AI mode (not a dropdown)
+- `/api/fix` always calls `fix_xaml` even for files with no findings — the cleanup pass at the start of `fix_xaml` self-heals legacy corruption, so skipping the call would leave bad `DisplayName` attributes on disk
 
 ## Environment
 

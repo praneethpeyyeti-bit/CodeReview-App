@@ -60,6 +60,16 @@ def fix_xaml(xml_content: str, findings: list[Finding]) -> dict:
     delete = False
     current_findings = list(findings)
 
+    # Self-heal pass: strip any DisplayName attribute that an earlier (buggy)
+    # version of ST-NMG-020 injected into typed UI sub-components like
+    # uix:TargetApp / uix:Target / uix:TargetAnchorable. Studio rejects the
+    # file with "Could not find member 'DisplayName' in type 'uix:TargetX'"
+    # whenever such a DisplayName slips in. Runs BEFORE the rule pipeline so
+    # the cleaned content participates in subsequent fixes too.
+    content, cleanup_changes = _strip_invalid_displaynames(content)
+    if cleanup_changes:
+        changes.extend(cleanup_changes)
+
     max_passes = 5  # cascading rules usually settle in 2–3 passes
     last_content = None
     for pass_num in range(1, max_passes + 1):
@@ -174,6 +184,161 @@ def fix_xaml(xml_content: str, findings: list[Finding]) -> dict:
         "changes_applied": deduped,
         "delete": delete,
     }
+
+
+# ── Cross-file reconciliation ─────────────────────────────────────────
+# After per-file fixes run, argument names inside callee workflows may have
+# been renamed (ST-NMG-002 prefix add, ST-NMG-010 PascalCase, ST-NMG-016
+# length shortening). InvokeWorkflowFile callers in OTHER files still bind
+# arguments with the OLD x:Key, which UiPath rejects with "argument doesn't
+# exist on the called workflow". `reconcile_invoke_workflow_keys` runs a
+# project-wide post-pass that rewrites caller x:Key to match the new name
+# whenever the rename can be inferred unambiguously.
+
+_PROJECT_INVOKE_RE = re.compile(
+    r'<ui:InvokeWorkflowFile\b[^>]*\bWorkflowFileName="([^"]+)"[^>]*>(.*?)</ui:InvokeWorkflowFile>',
+    re.DOTALL,
+)
+_PROJECT_ARGS_RE = re.compile(
+    r'(<ui:InvokeWorkflowFile\.Arguments>)(.*?)(</ui:InvokeWorkflowFile\.Arguments>)',
+    re.DOTALL,
+)
+_X_PROPERTY_NAME_RE = re.compile(r'<x:Property\b[^>]*\bName="([^"]+)"')
+
+
+def _pascalize_invoke_key(s: str) -> str:
+    """`OutDtVisible`-style PascalCase from `Out_dtVisible`-style input."""
+    return "".join((p[:1].upper() + p[1:]) for p in s.split("_") if p)
+
+
+def _match_invoke_key(old: str, declared: set[str]) -> str | None:
+    """Pick the unambiguous renamed argument name for an old InvokeWorkflowFile
+    key, mirroring how ST-NMG-002/010/016 transform argument names.
+    Returns None when no single best match is found.
+    """
+    if old in declared:
+        return old
+    lo = old.lower()
+    ci = [d for d in declared if d.lower() == lo]
+    if len(ci) == 1:
+        return ci[0]
+    # Prepend each direction prefix and try (case-insensitive) — covers
+    # ST-NMG-002 adding `out_` to a name that originally had `Out_`.
+    candidates: set[str] = set()
+    pasc = _pascalize_invoke_key(old)
+    for pre in ("in_", "out_", "io_"):
+        candidates.add((pre + pasc).lower())
+        candidates.add((pre + old).lower())
+    # Also try keeping the existing direction prefix and pascalizing only the body.
+    m = re.match(r"^((?:in|out|io)_)(.*)", old, re.I)
+    if m:
+        pre = m.group(1).lower()
+        candidates.add((pre + _pascalize_invoke_key(m.group(2))).lower())
+        candidates.add((pre + _pascalize_invoke_key(old)).lower())
+    matches = [d for d in declared if d.lower() in candidates]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _resolve_invoked_path(workflow_file_name: str, all_paths: set[str]) -> str | None:
+    """Resolve the caller's WorkflowFileName attribute (which is project-root
+    relative, often using backslashes) against the set of known
+    zip_entry_paths in the project. Picks the unique zip_entry_path that
+    ends with the (normalized) WorkflowFileName.
+    """
+    target = workflow_file_name.replace("\\", "/").lstrip("./")
+    if target in all_paths:
+        return target
+    suffix = "/" + target
+    matches = [p for p in all_paths if p.endswith(suffix) or p == target]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def reconcile_invoke_workflow_keys(fix_results: list[dict]) -> dict[str, list[str]]:
+    """Project-wide post-pass that rewrites caller InvokeWorkflowFile x:Key
+    bindings whenever the called workflow's argument was renamed. Mutates
+    each entry's `modified_content` in place and appends edit messages to
+    its `changes` list. Returns a map of file_name → edit messages.
+
+    Designed to run once, after all per-file `fix_xaml` calls in the
+    pipeline. Safe to call with no findings of any rule — it inspects the
+    final post-fix content directly rather than relying on rule findings.
+    """
+    if not fix_results:
+        return {}
+
+    # Build path → declared argument names map from FINAL content.
+    arg_decls: dict[str, set[str]] = {}
+    for fr in fix_results:
+        if fr.get("delete"):
+            continue
+        path = fr.get("zip_entry_path") or fr.get("file_name") or ""
+        if not path:
+            continue
+        path = path.replace("\\", "/")
+        names = _X_PROPERTY_NAME_RE.findall(fr.get("modified_content", "") or "")
+        if names:
+            arg_decls[path] = set(names)
+
+    if not arg_decls:
+        return {}
+
+    all_paths = set(arg_decls.keys())
+    edits_by_file: dict[str, list[str]] = {}
+
+    for fr in fix_results:
+        if fr.get("delete"):
+            continue
+        content = fr.get("modified_content", "") or ""
+        if "ui:InvokeWorkflowFile" not in content:
+            continue
+        file_label = fr.get("zip_entry_path") or fr.get("file_name") or ""
+        per_file_edits: list[str] = []
+
+        def patch_invoke(invoke_m: "re.Match[str]") -> str:
+            wf_attr = invoke_m.group(1)
+            target = _resolve_invoked_path(wf_attr, all_paths)
+            decls = arg_decls.get(target) if target else None
+            if not decls:
+                return invoke_m.group(0)
+
+            def patch_args(args_m: "re.Match[str]") -> str:
+                head, body, tail = args_m.group(1), args_m.group(2), args_m.group(3)
+
+                def patch_key(key_m: "re.Match[str]") -> str:
+                    old = key_m.group(1)
+                    if old in decls:
+                        return key_m.group(0)
+                    new = _match_invoke_key(old, decls)
+                    if not new or new == old:
+                        return key_m.group(0)
+                    per_file_edits.append(
+                        f"ST-NMG-002: Reconciled InvokeWorkflowFile arg key '{old}' -> '{new}' "
+                        f"(callee: {target})"
+                    )
+                    return f'x:Key="{new}"'
+
+                new_body = re.sub(r'x:Key="([^"]+)"', patch_key, body)
+                return f"{head}{new_body}{tail}"
+
+            full = invoke_m.group(0)
+            new_full = _PROJECT_ARGS_RE.sub(patch_args, full)
+            return new_full
+
+        new_content = _PROJECT_INVOKE_RE.sub(patch_invoke, content)
+        if new_content != content:
+            fr["modified_content"] = new_content
+            existing_changes = fr.get("changes")
+            if existing_changes is None:
+                fr["changes"] = per_file_edits
+            else:
+                existing_changes.extend(per_file_edits)
+            edits_by_file[file_label] = per_file_edits
+
+    return edits_by_file
 
 
 def _rule_priority(rule_id: str) -> int:
@@ -1722,10 +1887,14 @@ def _extract_activity_descriptor(elem: ET.Element) -> str | None:
 
     local = _local_tag(elem.tag)
 
-    # 2a. Assign → target variable from <Assign.To><OutArgument>[X]</OutArgument>...
-    if local == "Assign":
+    # 2a. Assign / AssignOperation → target variable from
+    # <Assign.To><OutArgument>[X]</OutArgument>... (or AssignOperation.To for
+    # Modern Multiple Assign rows). Combined with the type prefix in
+    # `_build_unique_displayname`, this yields `Assign 'varName'`.
+    if local in ("Assign", "AssignOperation"):
+        prop_tag = f"{local}.To"
         for child in elem:
-            if _local_tag(child.tag) != "Assign.To":
+            if _local_tag(child.tag) != prop_tag:
                 continue
             for gc in child:
                 text = (gc.text or "").strip()
@@ -1733,7 +1902,7 @@ def _extract_activity_descriptor(elem: ET.Element) -> str | None:
                     continue
                 cleaned = _strip_vb_brackets(text)
                 if cleaned:
-                    return f"to {cleaned}"
+                    return cleaned
         return None
 
     # 2b. LogMessage / Log → Level + Message hint
@@ -1749,11 +1918,16 @@ def _extract_activity_descriptor(elem: ET.Element) -> str | None:
             return f"Level={level}"
         return None
 
-    # 2c. WriteLine → Text
-    if local == "WriteLine":
+    # 2c. WriteLine / Comment → Text attribute holds the user content.
+    if local in ("WriteLine", "Comment"):
         text = elem.attrib.get("Text", "")
         if text:
-            return _strip_vb_brackets(html.unescape(text))[:40]
+            cleaned = _strip_vb_brackets(html.unescape(text))
+            # Strip a leading "// " comment marker if present so the resulting
+            # DisplayName reads naturally (e.g. "Comment 'Blank Test Case'").
+            cleaned = re.sub(r"^/{2,}\s*", "", cleaned).strip()
+            if cleaned:
+                return cleaned[:40]
         return None
 
     # 2d. InvokeWorkflowFile → workflow filename (basename, no extension)
@@ -1773,11 +1947,15 @@ def _extract_activity_descriptor(elem: ET.Element) -> str | None:
             return _strip_vb_brackets(dur)[:30]
         return None
 
-    # 2f. If / While / DoWhile → Condition
-    if local in ("If", "While", "DoWhile"):
+    # 2f. If / While / DoWhile / FlowDecision → Condition (attribute or
+    # <X.Condition> property-element form)
+    if local in ("If", "While", "DoWhile", "FlowDecision"):
         cond = elem.attrib.get("Condition", "")
         if cond:
             return _strip_vb_brackets(html.unescape(cond))[:40]
+        text = _read_property_element_text(elem, f"{local}.Condition")
+        if text:
+            return text[:40]
         return None
 
     # 2g. ForEach → collection being iterated
@@ -1785,15 +1963,191 @@ def _extract_activity_descriptor(elem: ET.Element) -> str | None:
         values = elem.attrib.get("Values", "") or elem.attrib.get("DataTable", "")
         if values:
             return _strip_vb_brackets(html.unescape(values))[:40]
+        # ForEach.Values / ForEachRow.DataTable property-element form
+        for prop in (f"{local}.Values", f"{local}.DataTable"):
+            text = _read_property_element_text(elem, prop)
+            if text:
+                return text[:40]
         return None
 
-    # 2h. Switch → Expression
-    if local == "Switch":
+    # 2h. Switch / FlowSwitch → Expression
+    if local in ("Switch", "FlowSwitch"):
         expr = elem.attrib.get("Expression", "")
         if expr:
             return _strip_vb_brackets(html.unescape(expr))[:40]
+        text = _read_property_element_text(elem, f"{local}.Expression")
+        if text:
+            return text[:40]
         return None
 
+    # 2h2. Throw / Rethrow → Exception expression
+    if local in ("Throw", "Rethrow"):
+        expr = elem.attrib.get("Exception", "")
+        if expr:
+            return _strip_vb_brackets(html.unescape(expr))[:40]
+        text = _read_property_element_text(elem, f"{local}.Exception")
+        if text:
+            return text[:40]
+        return None
+
+    # 2i. Container activities (Sequence/NSequence/TryCatch) → derive from
+    # the first meaningful inner activity. Pierces nested container shells
+    # so a TryCatch wrapping a Sequence wrapping a Click 'Save' resolves to
+    # `Click Save`, yielding `TryCatch 'Click Save'` after composition.
+    if local in _CONTAINER_TYPES:
+        return _container_inner_descriptor(elem)
+
+    # 2j. Generic fallback — for activity types we don't have an explicit
+    # case for, look for a meaningful well-known attribute (Text, Url,
+    # FileName, ...) or a property-element child holding the user's content.
+    # Without this, activities like MessageBox/OpenBrowser/SendHotkey would
+    # be left at their default Studio name even when they carry obviously
+    # descriptive content.
+    return _generic_attribute_descriptor(elem)
+
+
+_CONTAINER_TYPES: frozenset = frozenset({
+    "Sequence", "NSequence", "TryCatch",
+    # Flowchart-family containers — descend into their children to derive a
+    # meaningful descriptor (the first inner activity). Without this they'd
+    # be left at the Studio default name with no information added.
+    "Flowchart", "FlowStep",
+})
+
+
+def _read_property_element_text(elem: ET.Element, prop_tag: str) -> str | None:
+    """Read the inner text of a property element like <While.Condition> →
+    <InArgument>[expr]</InArgument>. Returns the cleaned VB expression or
+    literal, or None if the property element is missing/empty.
+    """
+    for child in elem:
+        if _local_tag(child.tag) != prop_tag:
+            continue
+        for gc in child:
+            text = (gc.text or "").strip()
+            if not text:
+                continue
+            cleaned = _strip_vb_brackets(html.unescape(text)).strip()
+            if cleaned:
+                return cleaned
+        # Sometimes the value is directly on the property element's text.
+        if child.text and child.text.strip():
+            cleaned = _strip_vb_brackets(html.unescape(child.text.strip())).strip()
+            if cleaned:
+                return cleaned
+    return None
+
+# Common attribute names that often hold descriptive user content. Order
+# matters — earlier entries are more likely to be the activity's primary
+# label (e.g. MessageBox.Caption beats MessageBox.Buttons).
+_GENERIC_DESCRIPTOR_ATTRS: tuple[str, ...] = (
+    # Primary text labels
+    "Text", "Caption", "Title", "Label", "Heading", "Subject", "Body",
+    # File / path / workflow
+    "WorkflowFileName", "FileName", "Path", "FilePath", "WorkbookPath",
+    "Source", "Destination", "TargetFolder", "Folder",
+    # Network
+    "Url", "EndpointURL", "Endpoint",
+    # Process / app / browser
+    "ProcessName", "ApplicationName", "Application", "BrowserURL",
+    "ExecutablePath",
+    # Excel
+    "SheetName", "Range", "TableName", "WorksheetName",
+    # Hotkey
+    "KeysList", "KeyName", "Hotkey", "Keys", "Key",
+    # Output / variable
+    "Variable", "OutputProperty", "Result",
+    # Command / arguments
+    "CommandText", "Command", "Arguments",
+    # Mail
+    "MailFolder", "Account",
+)
+
+
+def _generic_attribute_descriptor(elem: ET.Element) -> str | None:
+    """Best-effort descriptor for activities without an explicit case.
+
+    Tries (1) well-known attribute names in priority order, then (2)
+    property-element children whose suffix matches a well-known name
+    (drilling into InArgument/OutArgument text). Skips `{x:Null}`
+    placeholders and anything that strips to empty after VB-bracket
+    cleanup.
+    """
+    skip = {"True", "False", "{x:Null}", "*"}
+    for attr in _GENERIC_DESCRIPTOR_ATTRS:
+        val = elem.attrib.get(attr, "")
+        if not val or val in skip:
+            continue
+        cleaned = _strip_vb_brackets(html.unescape(val)).strip()
+        if cleaned and cleaned not in skip:
+            return cleaned[:40]
+
+    # Walk first-level property elements for InArgument/OutArgument text.
+    well_known = set(_GENERIC_DESCRIPTOR_ATTRS)
+    for child in elem:
+        ct = _local_tag(child.tag)
+        if "." not in ct:
+            continue
+        prop = ct.split(".", 1)[1]
+        if prop not in well_known:
+            continue
+        # The property element wraps an InArgument/OutArgument; its `.text`
+        # holds the VB expression like `[varName]` or a literal string.
+        for gc in child:
+            text = (gc.text or "").strip()
+            if not text:
+                continue
+            cleaned = _strip_vb_brackets(html.unescape(text)).strip()
+            if cleaned:
+                return cleaned[:40]
+    return None
+
+
+def _is_property_element(elem: ET.Element) -> bool:
+    """True for property-element wrappers like <Sequence.Variables>."""
+    return "." in _local_tag(elem.tag)
+
+
+def _container_inner_descriptor(elem: ET.Element, depth: int = 0) -> str | None:
+    """Recursively pierce container shells to label a container by its
+    first meaningful inner activity.
+
+    Sequence > Click 'Save'                       → 'Click Save'
+    TryCatch > Try > Sequence > LogMessage 'X'    → 'LogMessage X'
+    """
+    if depth > 4:
+        return None
+
+    local = _local_tag(elem.tag)
+
+    # TryCatch's body is inside the <TryCatch.Try> property element.
+    if local == "TryCatch":
+        try_body: ET.Element | None = None
+        for child in elem:
+            if _local_tag(child.tag) == "TryCatch.Try":
+                try_body = child
+                break
+        if try_body is None:
+            return None
+        children = list(try_body)
+    else:
+        children = list(elem)
+
+    for child in children:
+        if _is_property_element(child) or _is_non_activity_element(child):
+            continue
+        child_local = _local_tag(child.tag)
+        if child_local == "Variable":
+            continue
+        if child_local in _CONTAINER_TYPES:
+            inner = _container_inner_descriptor(child, depth + 1)
+            if inner:
+                return inner
+            continue
+        child_desc = _extract_activity_descriptor(child)
+        if child_desc:
+            return f"{child_local} {child_desc}"
+        return child_local
     return None
 
 
@@ -1837,6 +2191,11 @@ def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
         "FilterOperationArgument",
         "WorkflowViewState", "ViewState",
     }
+    # Also skip typed UI sub-components that REJECT a DisplayName attribute.
+    # `_TYPED_NO_DISPLAYNAME_TAGS` is the canonical "must not inject" set —
+    # adding DisplayName here makes Studio fail to load with "Could not find
+    # member 'DisplayName' in type 'uix:TargetX'".
+    skip_tags = skip_tags | _TYPED_NO_DISPLAYNAME_TAGS
     activities: list[tuple[str, str, bool, str | None]] = []
     for elem in root.iter():
         if _is_non_activity_element(elem):
@@ -1958,11 +2317,68 @@ def _fix_st_nmg_004(content: str, findings: list[Finding]) -> dict:
 
 
 _NMG020_STRUCTURAL: frozenset = frozenset({
-    "Sequence", "NSequence",
-    "Flowchart", "FlowDecision", "FlowStep", "FlowSwitch",
-    "Body", "TryCatch", "Try", "Catch", "Finally",
+    # Workflow roots / delegate wrappers — these don't have a DisplayName
+    # in the activity sense; Studio rejects DisplayName injection here.
     "Activity", "StateMachine",
+    "ActivityFunc", "ActivityAction",
+    # Property-element shells (rarely appear as bare elements; the
+    # `"." in tn` filter usually catches the property-element form, but
+    # keep these for safety on the bare-element case).
+    "Body", "Try", "Catch", "Finally",
+    # Modern UI-Automation target wrappers — Studio nests these inside parent
+    # NClick/NTypeInto activities and auto-numbers them; renaming adds noise.
+    # These typed components also DON'T accept a DisplayName attribute —
+    # UiPath rejects the file with "Could not find member 'DisplayName' in
+    # type 'uix:TargetX'" if we inject one here.
+    "Target", "TargetApp", "TargetAnchorable", "TargetRegion", "TargetImage",
+    "VerifyExecutionOptions", "VerifyExecutionTypeIntoOptions",
+    "VerifyExecutionClickOptions", "VerifyExecutionGetTextOptions",
+    "InputOptions", "OutputOptions", "ScreenshotOptions",
 })
+
+# Typed UI sub-components that DON'T accept a DisplayName attribute. If an
+# earlier buggy run of ST-NMG-020 erroneously injected one (the rule used to
+# rename these), we strip it on the next fix pass so Studio can load the
+# file again. Mirror of `_NMG020_STRUCTURAL` for the typed-component subset.
+_TYPED_NO_DISPLAYNAME_TAGS: frozenset = frozenset({
+    "Target", "TargetApp", "TargetAnchorable", "TargetRegion", "TargetImage",
+    "VerifyExecutionOptions", "VerifyExecutionTypeIntoOptions",
+    "VerifyExecutionClickOptions", "VerifyExecutionGetTextOptions",
+    "InputOptions", "OutputOptions", "ScreenshotOptions",
+})
+
+
+def _strip_invalid_displaynames(content: str) -> tuple[str, list[str]]:
+    """Remove DisplayName attributes from typed UI sub-components that
+    reject them. Returns (new_content, list-of-change-messages).
+    """
+    changes: list[str] = []
+    new_content = content
+    for tag in _TYPED_NO_DISPLAYNAME_TAGS:
+        # Match opening tags `<ns:Tag ... DisplayName="X" ...>` (or self-closing).
+        # Captures the namespace prefix, attrs before, the DisplayName attr,
+        # attrs after, and the closing `/>` or `>`. We rebuild without the
+        # DisplayName attribute and a single space where it lived.
+        pattern = re.compile(
+            r'(<(?:\w+:)?' + re.escape(tag) + r'\b[^>]*?)\s+DisplayName="([^"]*)"([^>]*?/?>)',
+            re.DOTALL,
+        )
+        def _drop(m: "re.Match[str]") -> str:
+            old_dn = m.group(2)
+            changes.append(
+                f"ST-NMG-020: Cleanup — stripped invalid DisplayName='{old_dn}' from <{tag}> "
+                f"(typed component does not accept DisplayName)"
+            )
+            return m.group(1) + m.group(3)
+        # Repeat until no more matches (multiple DisplayName attributes per
+        # element are theoretically possible but vanishingly rare).
+        while True:
+            new_content2, n = pattern.subn(_drop, new_content)
+            if n == 0:
+                break
+            new_content = new_content2
+    return new_content, changes
+
 
 _NMG020_SKIP_TAGS: frozenset = frozenset({
     "Members", "Property", "Variable",
@@ -1982,11 +2398,14 @@ _NMG020_SKIP_TAGS: frozenset = frozenset({
 def _fix_st_nmg_020(content: str, findings: list[Finding]) -> dict:
     """ST-NMG-020: Rename activities still using the default Studio name.
 
-    For each non-structural activity whose DisplayName is missing or equals
-    its type name, derive a meaningful descriptor (selector for UI
-    activities, type-specific property for others) and either INSERT or
-    REPLACE the DisplayName attribute. Activities with no derivable
-    descriptor are skipped (left for manual renaming).
+    Every default-named activity gets a meaningful descriptor-based name.
+    Type-specific extractors cover Assign/AssignOperation/LogMessage/
+    WriteLine/Comment/InvokeWorkflowFile/Delay/If/While/DoWhile/ForEach/
+    Switch/Throw/Rethrow/Flowchart-family/Sequence/TryCatch, plus a generic
+    attribute-based fallback for everything else (Text, Url, FileName, ...).
+    Activities for which no meaningful descriptor can be derived are left
+    untouched — the auto-fix never falls back to a numeric counter, since
+    `Break (1)` adds no information over plain `Break`.
     """
     if not findings:
         return {"modified": False, "content": content, "changes": []}
@@ -1996,7 +2415,7 @@ def _fix_st_nmg_020(content: str, findings: list[Finding]) -> dict:
     except ET.ParseError:
         return {"modified": False, "content": content, "changes": []}
 
-    # Walk doc order and collect activities to rename plus their descriptors
+    # Walk doc order and collect activities to rename plus their descriptors.
     to_rename: list[tuple[str, str, bool, str]] = []  # (type, effective_dn, explicit, descriptor)
     for elem in root.iter():
         if _is_non_activity_element(elem):
@@ -2012,7 +2431,7 @@ def _fix_st_nmg_020(content: str, findings: list[Finding]) -> dict:
             continue
         descriptor = _extract_activity_descriptor(elem)
         if not descriptor:
-            continue  # can't derive — leave for manual rename
+            continue  # no meaningful name available — skip rather than use a counter
         to_rename.append((tn, explicit_dn if explicit_dn is not None else tn, explicit_dn is not None, descriptor))
 
     if not to_rename:

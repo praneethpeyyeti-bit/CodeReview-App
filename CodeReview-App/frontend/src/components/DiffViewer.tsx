@@ -1,5 +1,129 @@
 import { useState } from 'react';
-import { FixFileResult, acceptFix } from '../services/apiClient';
+import { FixFileResult, acceptFix, fetchPassthrough } from '../services/apiClient';
+
+// File System Access API: typed loosely so TS doesn't bark on browsers
+// without the lib.dom additions for showDirectoryPicker.
+type DirHandle = any;
+
+const supportsDirectoryPicker = (): boolean =>
+  typeof window !== 'undefined' && typeof (window as any).showDirectoryPicker === 'function';
+
+// File System Access API rejects names containing < > : " / \ | ? * or
+// control chars, names that are empty / "." / "..", and Windows reserved
+// device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9). It also rejects
+// trailing dots and trailing whitespace. We sanitize segment-by-segment.
+const _FSA_INVALID_CHARS = /[<>:"|?*\x00-\x1f]/;
+const _FSA_RESERVED_NAMES = new Set([
+  'CON', 'PRN', 'AUX', 'NUL',
+  ...Array.from({ length: 9 }, (_, i) => `COM${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `LPT${i + 1}`),
+]);
+
+function isValidFsaSegment(seg: string): boolean {
+  if (!seg || seg === '.' || seg === '..') return false;
+  if (_FSA_INVALID_CHARS.test(seg)) return false;
+  // Trailing dots/spaces aren't allowed on Windows.
+  if (/[. ]$/.test(seg)) return false;
+  // Reserved device names (case-insensitive, with or without extension).
+  const stem = seg.split('.')[0].toUpperCase();
+  if (_FSA_RESERVED_NAMES.has(stem)) return false;
+  return true;
+}
+
+function splitRelativePath(
+  relativePath: string,
+): { dirParts: string[]; fileName: string } | null {
+  // Trailing slash → directory entry, no file to write.
+  if (/[\\/]$/.test(relativePath)) return null;
+  const parts = relativePath
+    .split(/[\\/]/)
+    .map((p) => p.trim())
+    .filter((p) => p && p !== '.' && p !== '..');
+  if (parts.length === 0) return null;
+  const fileName = parts.pop()!;
+  if (!isValidFsaSegment(fileName)) return null;
+  // Drop any unsafe directory segments rather than failing the whole entry.
+  const dirParts = parts.filter(isValidFsaSegment);
+  return { dirParts, fileName };
+}
+
+async function ensureSubdir(root: DirHandle, segments: string[]): Promise<DirHandle> {
+  let current = root;
+  for (const seg of segments) {
+    current = await current.getDirectoryHandle(seg, { create: true });
+  }
+  return current;
+}
+
+async function writeTextFile(
+  root: DirHandle,
+  relativePath: string,
+  content: string,
+): Promise<boolean> {
+  const split = splitRelativePath(relativePath);
+  if (!split) return false;
+  const dir = await ensureSubdir(root, split.dirParts);
+  const handle = await dir.getFileHandle(split.fileName, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(content);
+  await writable.close();
+  return true;
+}
+
+async function writeBytesFile(
+  root: DirHandle,
+  relativePath: string,
+  bytes: ArrayBuffer,
+): Promise<boolean> {
+  const split = splitRelativePath(relativePath);
+  if (!split) return false;
+  const dir = await ensureSubdir(root, split.dirParts);
+  const handle = await dir.getFileHandle(split.fileName, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(bytes);
+  await writable.close();
+  return true;
+}
+
+async function removeIfExists(root: DirHandle, relativePath: string): Promise<void> {
+  const split = splitRelativePath(relativePath);
+  if (!split) return;
+  let dir = root;
+  try {
+    for (const seg of split.dirParts) {
+      dir = await dir.getDirectoryHandle(seg, { create: false });
+    }
+    await dir.removeEntry(split.fileName);
+  } catch {
+    // Already absent or unreadable — fine.
+  }
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Run async tasks with bounded concurrency. FSA serializes per file, but
+// pipelining several at once cuts total wall time noticeably on projects
+// with many small files.
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+}
 
 interface Props {
   projectName: string;
@@ -118,6 +242,9 @@ export default function DiffViewer({ projectName, files, projectJson, fixId, onC
   const [error, setError] = useState<string | null>(null);
   const [showOutputPrompt, setShowOutputPrompt] = useState(false);
   const [outputDir, setOutputDir] = useState('');
+  const [dirHandle, setDirHandle] = useState<DirHandle | null>(null);
+  const [pickedFolderName, setPickedFolderName] = useState<string>('');
+  const [saveProgress, setSaveProgress] = useState<{ done: number; total: number } | null>(null);
   // Track which files have their fixes excluded (use original content instead)
   const [excludedFiles, setExcludedFiles] = useState<Set<string>>(new Set());
 
@@ -145,6 +272,30 @@ export default function DiffViewer({ projectName, files, projectJson, fixId, onC
     setShowOutputPrompt(true);
   };
 
+  const handleBrowseFolder = async () => {
+    if (!supportsDirectoryPicker()) {
+      setError('Folder picker is not available in this browser. Please type the path manually.');
+      return;
+    }
+    try {
+      const handle = await (window as any).showDirectoryPicker({ mode: 'readwrite' });
+      setDirHandle(handle);
+      setPickedFolderName(handle.name);
+      setOutputDir('');  // The handle takes precedence; clear typed path to avoid confusion.
+      setError(null);
+    } catch (err: any) {
+      // User cancelled the picker — silently swallow AbortError.
+      if (err?.name !== 'AbortError') {
+        setError(err?.message ?? 'Failed to open folder picker');
+      }
+    }
+  };
+
+  const clearPickedFolder = () => {
+    setDirHandle(null);
+    setPickedFolderName('');
+  };
+
   const handleConfirmSave = async () => {
     setAccepting(true);
     setError(null);
@@ -163,12 +314,94 @@ export default function DiffViewer({ projectName, files, projectJson, fixId, onC
           delete: willDelete,
         };
       });
+
+      if (dirHandle) {
+        // Client-side write: send each XAML to the picked folder via the
+        // File System Access API, then fetch the cached non-XAML
+        // passthrough files from the backend and write those too. We
+        // collect per-entry failures so one bad path (illegal name,
+        // reserved Windows name, etc.) doesn't abort the whole save.
+        const xamlPaths = new Set(
+          filesToSave.map((f) => f.zip_entry_path || f.file_name).filter(Boolean)
+        );
+        const passthrough = fixId ? await fetchPassthrough(fixId) : [];
+        const usefulPassthrough = passthrough.filter(
+          (p) => p.zip_entry_path && !xamlPaths.has(p.zip_entry_path)
+        );
+        const totalSteps =
+          filesToSave.length + usefulPassthrough.length + (projectJson ? 1 : 0);
+        let stepDone = 0;
+        const tick = () => {
+          stepDone++;
+          setSaveProgress({ done: stepDone, total: totalSteps });
+        };
+        setSaveProgress({ done: 0, total: totalSteps });
+
+        const failures: string[] = [];
+        let skippedNames = 0;
+        let passthroughCount = 0;
+        await runWithConcurrency(usefulPassthrough, 6, async (p) => {
+          try {
+            const bytes = base64ToBytes(p.content_base64);
+            const ok = await writeBytesFile(dirHandle, p.zip_entry_path, bytes.buffer);
+            if (ok) passthroughCount++;
+            else skippedNames++;
+          } catch (e: any) {
+            failures.push(`${p.zip_entry_path}: ${e?.message ?? e}`);
+          }
+          tick();
+        });
+        let savedCount = 0;
+        let deletedCount = 0;
+        await runWithConcurrency(filesToSave, 6, async (f) => {
+          const rel = f.zip_entry_path || f.file_name;
+          if (!rel) {
+            tick();
+            return;
+          }
+          try {
+            if (f.delete) {
+              await removeIfExists(dirHandle, rel);
+              deletedCount++;
+            } else {
+              const ok = await writeTextFile(dirHandle, rel, f.modified_content);
+              if (ok) savedCount++;
+              else skippedNames++;
+            }
+          } catch (e: any) {
+            failures.push(`${rel}: ${e?.message ?? e}`);
+          }
+          tick();
+        });
+        if (projectJson) {
+          const zipPaths = filesToSave.map((f) => f.zip_entry_path).filter(Boolean) as string[];
+          const rootFolder = zipPaths.length > 0 ? zipPaths[0].split('/')[0] : '';
+          const pjPath = rootFolder ? `${rootFolder}/project.json` : 'project.json';
+          try {
+            await writeTextFile(dirHandle, pjPath, projectJson);
+          } catch (e: any) {
+            failures.push(`${pjPath}: ${e?.message ?? e}`);
+          }
+          tick();
+        }
+        if (failures.length > 0) {
+          const head = failures.slice(0, 3).join(' · ');
+          const more = failures.length > 3 ? ` (+${failures.length - 3} more)` : '';
+          setError(`Saved ${savedCount} XAML + ${passthroughCount} other file(s); ${failures.length} failed: ${head}${more}`);
+        }
+        const skipNote = skippedNames > 0 ? `, ${skippedNames} skipped` : '';
+        const delNote = deletedCount ? `, ${deletedCount} deleted` : '';
+        onAccepted(`${pickedFolderName}  (${savedCount} saved${delNote}${skipNote})`);
+        return;
+      }
+
       const res = await acceptFix(projectName, filesToSave, outputDir || undefined, projectJson, fixId);
       onAccepted(res.saved_path);
     } catch (err: any) {
       setError(err.message ?? 'Failed to save fixes');
     } finally {
       setAccepting(false);
+      setSaveProgress(null);
     }
   };
 
@@ -216,7 +449,11 @@ export default function DiffViewer({ projectName, files, projectJson, fixId, onC
                 disabled={accepting}
                 className="px-4 py-1.5 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition-colors disabled:opacity-50"
               >
-                {accepting ? 'Saving...' : 'Accept All & Save'}
+                {accepting
+                  ? saveProgress
+                    ? `Saving ${saveProgress.done}/${saveProgress.total}...`
+                    : 'Saving...'
+                  : 'Accept All & Save'}
               </button>
             )}
             <button
@@ -240,22 +477,51 @@ export default function DiffViewer({ projectName, files, projectJson, fixId, onC
           <div className="px-6 py-4 bg-ui-g50 border-b border-ui-g200">
             <p className="text-sm font-medium text-ui-g700 mb-2">Choose output folder</p>
             <p className="text-xs text-ui-g500 mb-3">
-              Leave empty to use the default server output directory.
+              Click Browse to pick a folder on your machine, or type a server-side path. Leave empty to use the default server output directory.
             </p>
             <div className="flex items-center gap-3">
-              <input
-                type="text"
-                value={outputDir}
-                onChange={(e) => setOutputDir(e.target.value)}
-                placeholder="e.g. C:\output\MyProject"
-                className="flex-1 border border-ui-g300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ui-orange focus:border-ui-orange"
-              />
+              {dirHandle ? (
+                <div className="flex-1 flex items-center justify-between border border-ui-g300 rounded-lg px-3 py-2 text-sm bg-white">
+                  <span className="text-ui-g700 truncate">
+                    <span className="text-ui-g500">Selected folder: </span>
+                    <span className="font-medium">{pickedFolderName}</span>
+                  </span>
+                  <button
+                    onClick={clearPickedFolder}
+                    className="ml-3 text-xs text-ui-g500 hover:text-ui-g700 underline"
+                    type="button"
+                  >
+                    Clear
+                  </button>
+                </div>
+              ) : (
+                <input
+                  type="text"
+                  value={outputDir}
+                  onChange={(e) => setOutputDir(e.target.value)}
+                  placeholder="e.g. C:\output\MyProject"
+                  className="flex-1 border border-ui-g300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ui-orange focus:border-ui-orange"
+                />
+              )}
+              <button
+                onClick={handleBrowseFolder}
+                disabled={accepting}
+                title={supportsDirectoryPicker() ? 'Pick a folder via your OS file picker' : 'Folder picker is not supported in this browser'}
+                className="px-4 py-2 bg-ui-navy text-white text-sm font-medium rounded-lg hover:bg-ui-g800 transition-colors disabled:opacity-50"
+                type="button"
+              >
+                Browse...
+              </button>
               <button
                 onClick={handleConfirmSave}
                 disabled={accepting}
                 className="px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition-colors disabled:opacity-50"
               >
-                {accepting ? 'Saving...' : 'Save'}
+                {accepting
+                  ? saveProgress
+                    ? `Saving ${saveProgress.done}/${saveProgress.total}...`
+                    : 'Saving...'
+                  : 'Save'}
               </button>
               <button
                 onClick={() => setShowOutputPrompt(false)}

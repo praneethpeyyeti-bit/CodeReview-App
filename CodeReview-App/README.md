@@ -7,7 +7,7 @@ An AI-powered and static analysis code review tool for UiPath RPA workflows. Upl
 - **Static Analysis (default)** — Instant, deterministic results from 37 rule checkers. No UiPath auth, no Agent Units, byte-stable output across runs.
 - **AI-Powered Review (opt-in)** — Deep analysis via Claude / GPT-4o / Gemini through UiPath AI Trust Layer. `temperature=0` + `seed=42` + submission-order batch collection + deterministic post-sort → same input ⇒ same output.
 - **38 Workflow Analyzer Rules** — Naming, design, UI automation, performance, reliability, security, general quality
-- **Auto-Fix 18 Rules with Convergence Loop + Post-Pass** — The fix pipeline runs up to 5 passes with a static re-review between passes, so cascades like `prefix add → length overflow → PascalCase → word-split shorten → default-name rewrite using final names` converge automatically in a single `/api/fix` call. After convergence, a post-pass disambiguates sibling-scope variable duplicates and re-runs unused-variable cleanup on any orphans the disambiguation surfaced.
+- **Auto-Fix 18 Rules with Cascading Loop + Project-wide Reconciliation** — The cascading fix loop runs up to 5 iterations with a static re-review between each, so chained violations like `prefix add → length overflow → PascalCase → word-split shorten → default-name rewrite using final names` settle automatically in a single `/api/fix` call. After convergence, three post-passes run: (1) sibling-scope variable disambiguation + GEN-001 re-run, (2) `_strip_invalid_displaynames` cleanup that removes `DisplayName` attributes wrongly injected into typed UI sub-components (`uix:TargetApp`, `TargetAnchorable`, etc. — which Studio rejects), (3) `reconcile_invoke_workflow_keys` project-wide pass that rewrites InvokeWorkflowFile caller `x:Key` bindings whenever a callee's argument was renamed.
 - **Collision-aware renames** — Prefix-add (ST-NMG-001/002/009/011) and length-shorten (ST-NMG-008/016) rules check `_collect_declared_names` before applying. If the candidate `new_name` is already declared, the rule SKIPS rather than producing a duplicate that UiPath would reject as "name already exists in environment scope". The skip is surfaced in the change log so the user knows why the finding wasn't auto-fixed.
 - **Side-by-Side Diff** — Preview all changes before accepting
 - **Folder Structure Preserved** — Fixed files maintain original ZIP directory layout
@@ -107,8 +107,10 @@ on purpose, so every new clone has to authenticate once.
 4. **Review findings** — Filter by severity, category, or file in the dashboard
 5. **Auto-fix** — Click "Auto-Fix" to apply safe naming corrections
 6. **Review diffs** — Inspect changes side-by-side before accepting
-7. **Accept & save** — Fixed files saved preserving original folder structure
+7. **Accept & save** — Click "Browse..." to pick a destination folder via the native picker (Chrome/Edge) — files write directly via the File System Access API. Fall back to typing a server-side path if FSA isn't available. Original ZIP folder structure is preserved either way.
 8. **Export** — Download findings as an Excel report
+
+See [USAGE.md](USAGE.md) for a step-by-step walkthrough with screenshots of every screen, plus troubleshooting tips.
 
 ## Review Modes
 
@@ -130,7 +132,7 @@ Text-level operations on raw XAML — safe for UiPath Studio to open without err
 |------|--------------|--------|
 | ST-NMG-001 | Add type prefix to variables (`str_`, `int_`, `dt_`, `bln_`, `dtm_`, `ts_`, `arr_`, `dic_`) | Regex rename |
 | ST-NMG-002 | Add direction prefix to arguments (`in_`, `out_`, `io_`) | Regex rename |
-| ST-NMG-004 | Rename duplicate DisplayNames using selector-derived labels (e.g. `Click 'Save'`); counter fallback | Positional attribute-value rewrite |
+| ST-NMG-004 | Rename duplicate DisplayNames using selector-derived labels (e.g. `Click 'Save'`). Skips typed UI sub-components (`uix:Target`, `TargetApp`, `TargetAnchorable`, `VerifyExecution*`) that reject `DisplayName` injection | Positional attribute-value rewrite |
 | ST-NMG-005 | Remove inner-scope shadow variable declarations; keep outermost | Element removal |
 | ST-NMG-006 | Remove variable that collides with an argument; retain argument | Element removal |
 | ST-NMG-008 | Shorten variable name > 30 chars (preserves prefix, drops middle words) | Regex rename |
@@ -139,7 +141,7 @@ Text-level operations on raw XAML — safe for UiPath Studio to open without err
 | ST-NMG-011 | Add direction prefix (`in_`/`out_`/`io_`) to DataTable arguments | Regex rename |
 | ST-NMG-012 | Remove default values for **In** arguments (Out/InOut skipped). Handles both element-form (`<this:Main.arg>...</this:Main.arg>`) and attribute-form (`this:Main.arg="value"` on root) | Element removal + attribute strip |
 | ST-NMG-016 | Shorten argument name > 30 chars | Regex rename |
-| ST-NMG-020 | Rename activities still using the Studio default DisplayName (e.g. `Click` → `Click 'Save'` from selector, `Assign` → `Assign 'to str_Customer'` from `Assign.To`, `LogMessage` → `LogMessage 'Order processed'` from Message). Runs LAST in the NMG tier so descriptors reference final variable/argument names | ET-guided + positional regex (insert or replace DisplayName) |
+| ST-NMG-020 | Rename activities still using the Studio default DisplayName. Per-type descriptors: UI selectors (`Click` → `Click 'Save'`), `Assign`/`AssignOperation` target variable (→ `Assign 'str_Customer'`), `LogMessage` Message text (→ `LogMessage 'Order processed'`), `Comment` Text, `Throw`/`Rethrow` Exception expression, `If`/`While`/`DoWhile`/`FlowDecision` Condition (attribute or property element), `ForEach` Values, `Switch` Expression, `InvokeWorkflowFile` filename. Containers (`Sequence`, `NSequence`, `TryCatch`, `Flowchart`, `FlowStep`) recurse into the first inner activity (e.g. `Sequence 'Click Save'`). Generic attribute fallback covers anything else with a meaningful `Text`/`Url`/`FileName`/`Caption`/`ProcessName` attribute. **No counter fallback** — activities for which no descriptor can be derived are left alone. Runs LAST in the NMG tier so descriptors reference final variable/argument names | ET-guided + positional regex (insert or replace DisplayName) |
 | ST-DBP-003 | Insert `<ui:LogMessage Level="Error">` inside empty Catch body (includes exception type, message, source). Auto-adds `xmlns:ui` on the Activity root if missing | ET-guided + positional insertion |
 | ST-DBP-023 | Delete empty workflow file on accept | File-level deletion via fix-response `delete` flag |
 | GEN-001 | Remove unused `<Variable/>` declarations | Element removal |
@@ -147,6 +149,13 @@ Text-level operations on raw XAML — safe for UiPath Studio to open without err
 | ST-NMG-005-SIBLINGS | Disambiguate sibling-scope variable duplicates by suffixing with a bare digit (`dt_FoldersData2`, `dt_FoldersData3`, ...). UiPath flags any cross-scope name reuse as "Variable Overrides Variable" — variables in UiPath are scope-local, so renaming siblings preserves runtime semantics exactly. Scope-bounded rename via owner `WorkflowViewState.IdRef`; ancestor-shadow cases are skipped (already handled by ST-NMG-005). After the pass, GEN-001 re-runs to remove orphan declarations that disambiguation surfaced | Post-convergence ET-guided rename within the owner activity's text span |
 
 After auto-fix, findings for fixed rules show `status = "Fixed"` in the review grid. Renames that would create a name collision (either with a pre-existing declaration or with another rename's target) are skipped with a `SKIPPED` line in the change log explaining why.
+
+### Project-wide post-passes
+
+Two passes run automatically once per `/api/fix` call, after the per-file convergence loop:
+
+- **`_strip_invalid_displaynames` (DisplayName cleanup)** — Strips `DisplayName="..."` from typed UI sub-components that REJECT the attribute: `uix:Target`, `TargetApp`, `TargetAnchorable`, `TargetRegion`, `TargetImage`, `VerifyExecutionOptions`/`TypeIntoOptions`/`ClickOptions`/`GetTextOptions`, `InputOptions`, `OutputOptions`, `ScreenshotOptions`. Without this, Studio fails to load with `Could not find member 'DisplayName' in type 'uix:TargetX'`. Runs at the start of every `fix_xaml`, even on files with no findings — projects corrupted by an older buggy version of the rule self-heal on the next Auto-Fix.
+- **`reconcile_invoke_workflow_keys` (cross-file InvokeWorkflowFile reconciliation)** — When a callee workflow's argument is renamed (e.g. `Out_dtVisible` → `out_OutDtVisible` after ST-NMG-002 + ST-NMG-010), every caller binding `<InArgument x:Key="Out_dtVisible">` in OTHER files becomes invalid. UiPath rejects them at runtime with "argument doesn't exist on the called workflow". The reconciler resolves each caller's `WorkflowFileName` against known zip paths via suffix-matching, then maps each old key to the renamed arg via case-insensitive equality, prefix-prepend, and PascalCase reconstruction. Edits are appended to the caller's change log as `ST-NMG-002: Reconciled InvokeWorkflowFile arg key 'old' -> 'new'`.
 
 ### Detection-Only Rules (21)
 

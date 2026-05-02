@@ -154,6 +154,15 @@ def _check_st_nmg_004(ctx: ReviewContext) -> list[Finding]:
     generic_names = {
         "Sequence", "Flowchart", "FlowDecision", "FlowStep",
         "Body", "TryCatch", "Try", "Catch", "Finally",
+        # Typed UI sub-components — these are nested inside parent activities
+        # and their DEFAULT display names equal the type name. They reject
+        # `DisplayName` injection (Studio: "Could not find member 'DisplayName'
+        # in type 'uix:TargetX'"), so flagging duplicates here just produces
+        # findings the fixer can't act on without corrupting the file.
+        "Target", "TargetApp", "TargetAnchorable", "TargetRegion", "TargetImage",
+        "VerifyExecutionOptions", "VerifyExecutionTypeIntoOptions",
+        "VerifyExecutionClickOptions", "VerifyExecutionGetTextOptions",
+        "InputOptions", "OutputOptions", "ScreenshotOptions",
     }
     names = [a.display_name for a in ctx.activities if a.display_name not in generic_names]
     counts = Counter(names)
@@ -431,18 +440,21 @@ def _check_st_nmg_016(ctx: ReviewContext) -> list[Finding]:
 # acceptable — these are structural containers where a more descriptive
 # name is usually unnecessary and often misleading.
 _STRUCTURAL_ACTIVITY_TYPES: frozenset = frozenset({
-    "Sequence", "NSequence",
-    "Flowchart", "FlowDecision", "FlowStep", "FlowSwitch",
-    "Body", "TryCatch", "Try", "Catch", "Finally",
+    # Workflow roots / delegate wrappers — Studio rejects DisplayName here.
     "Activity", "StateMachine",
-    # Statement-like activities whose type name IS the meaningful name —
-    # asking the user to rename "Break" or "Rethrow" to a synthetic label
-    # adds noise without information. ActivityFunc is a generic delegate
-    # wrapper with no derivable descriptor.
-    "Break", "Continue", "Rethrow", "Throw",
     "ActivityFunc", "ActivityAction",
-    "Pick", "PickBranch",
-    "TerminateWorkflow",
+    # Property-element shells (also caught by the "." filter, kept for
+    # safety on the bare-element case).
+    "Body", "Try", "Catch", "Finally",
+    # Modern UI-Automation target wrappers — nested inside NClick.Target /
+    # NTypeInto.Target etc. Studio auto-numbers them, they aren't surfaced
+    # as user-facing activities, AND most are typed components that REJECT
+    # DisplayName injection ("Could not find member 'DisplayName' in type
+    # 'uix:TargetX'"). Flagging them produces noise the fixer can't act on.
+    "Target", "TargetApp", "TargetAnchorable", "TargetRegion", "TargetImage",
+    "VerifyExecutionOptions", "VerifyExecutionTypeIntoOptions",
+    "VerifyExecutionClickOptions", "VerifyExecutionGetTextOptions",
+    "InputOptions", "OutputOptions", "ScreenshotOptions",
 })
 
 
@@ -450,14 +462,15 @@ def _check_st_nmg_020(ctx: ReviewContext) -> list[Finding]:
     """ST-NMG-020: Default Studio Display Name.
 
     Flags any activity whose DisplayName was left at the Studio default
-    (either missing or equal to the activity type). Structural containers
-    (Sequence, Flowchart, TryCatch, ...) are excluded because leaving those
-    defaults is common and usually intentional.
+    (either missing or equal to the activity type). Flowchart-family nodes
+    and statement-like activities (Break/Throw/...) are excluded because
+    they have no meaningful descriptor to derive.
 
     Auto-fix renames such activities using a meaningful descriptor —
     selector content for UI Automation activities (Click/TypeInto/GetText/
-    etc.) or the most telling property for others (Assign's target variable,
-    LogMessage's Message, InvokeWorkflowFile's filename, ...).
+    etc.), the most telling property for others (Assign's target variable,
+    LogMessage's Message, InvokeWorkflowFile's filename, ...), and the
+    first meaningful inner activity for containers (Sequence, TryCatch).
     """
     findings: list[Finding] = []
     for a in ctx.activities:

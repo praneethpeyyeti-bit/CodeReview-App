@@ -100,6 +100,22 @@ export async function submitFix(formData: FormData): Promise<FixResponse> {
   return res.json();
 }
 
+export interface PassthroughFile {
+  zip_entry_path: string;
+  content_base64: string;
+}
+
+export async function fetchPassthrough(fixId: string): Promise<PassthroughFile[]> {
+  const res = await fetch(`${API_BASE}/api/fix/passthrough/${encodeURIComponent(fixId)}`);
+  if (!res.ok) {
+    if (res.status === 404) return [];
+    const err = await res.json().catch(() => ({ detail: 'Unknown error' }));
+    throw new Error(err.detail ?? `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return data.files ?? [];
+}
+
 export async function acceptFix(
   projectName: string,
   files: { file_name: string; zip_entry_path?: string; modified_content: string; delete?: boolean }[],
